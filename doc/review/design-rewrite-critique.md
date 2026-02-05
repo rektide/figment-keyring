@@ -1,0 +1,5 @@
+- we must be able to support multiple keyrings
+- i love the idea being able to use figment to specify which keyrings to search
+- user and system keyrings are special keyrings that we want the user to easily be able to pick from and compose among choices
+- by default we should only look at the users keyring
+- i'd like to write a provider that extends the typical provider that can do lazy providing. this is a secondary objective; a simple to understand primary provider is the most important thing.

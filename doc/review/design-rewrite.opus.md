@@ -1,8 +1,8 @@
 # Figment Keyring Provider - Revised Design
 
 **Author**: Claude (opus)  
-**Based on**: Cross-review synthesis from Opus, GLM, and Kimi reviews  
-**Status**: Draft
+**Based on**: Cross-review synthesis + author critique  
+**Status**: Draft v2
 
 ---
 
@@ -14,14 +14,44 @@ System keyrings offer encryption at rest, session-based access control, and OS-l
 
 ---
 
-## Design
+## Design Goals
 
-### Core API
+1. **Simple primary provider** - Easy to understand and use for common cases
+2. **Multiple keyring support** - Search across user, system, or custom keyrings
+3. **Composable keyring selection** - Use Figment itself to configure which keyrings to search
+4. **User keyring by default** - Secure default; system keyring requires explicit opt-in
+5. **Lazy provider (secondary)** - Future extension for deferred secret retrieval
+
+---
+
+## Core API
+
+### Keyring Selection
 
 ```rust
-use figment2::providers::Provider;
+/// Identifies which keyring backend to use.
+#[derive(Clone, Debug)]
+pub enum Keyring {
+    /// Current user's keyring (default, most common)
+    User,
+    /// System-wide keyring (requires elevated permissions on some platforms)
+    System,
+    /// Custom keyring by name (platform-specific interpretation)
+    Named(String),
+}
 
+impl Default for Keyring {
+    fn default() -> Self {
+        Keyring::User
+    }
+}
+```
+
+### KeyringProvider
+
+```rust
 pub struct KeyringProvider {
+    keyring: Keyring,
     service: String,
     credential_name: String,
     config_key: Option<String>,
@@ -31,86 +61,215 @@ pub struct KeyringProvider {
 
 impl KeyringProvider {
     /// Create a provider for a single keyring entry.
-    /// 
-    /// - `service`: Application identifier (e.g., "myapp")
-    /// - `credential_name`: Entry name in keyring (e.g., "api_key")
+    /// Uses the user keyring by default.
     pub fn new(service: &str, credential_name: &str) -> Self;
     
+    /// Use the system keyring instead of user keyring.
+    pub fn system(self) -> Self;
+    
+    /// Use a specific named keyring.
+    pub fn keyring(self, keyring: Keyring) -> Self;
+    
     /// Map keyring entry to a different config key name.
-    /// Default: uses `credential_name` as the config key.
     pub fn as_key(self, key: &str) -> Self;
     
     /// Target a specific Figment2 profile.
-    /// Default: uses the default profile.
     pub fn with_profile(self, profile: Profile) -> Self;
     
-    /// Don't fail if entry is missing; allow other providers to supply value.
-    /// Default: missing entry is an error.
+    /// Don't fail if entry is missing.
     pub fn optional(self) -> Self;
 }
+```
 
-impl Provider for KeyringProvider {
-    fn metadata(&self) -> Metadata;
-    fn data(&self) -> Result<Map<Profile, Dict>, Error>;
+### Basic Usage
+
+```rust
+// User keyring (default) - most common case
+KeyringProvider::new("myapp", "api_key")
+
+// Explicit system keyring
+KeyringProvider::new("myapp", "shared_secret").system()
+
+// Named keyring
+KeyringProvider::new("myapp", "api_key")
+    .keyring(Keyring::Named("login".into()))
+```
+
+---
+
+## Multi-Keyring Search
+
+### KeyringSearch Provider
+
+For searching across multiple keyrings in priority order:
+
+```rust
+pub struct KeyringSearch {
+    keyrings: Vec<Keyring>,
+    service: String,
+    credential_name: String,
+    config_key: Option<String>,
+    profile: Option<Profile>,
+}
+
+impl KeyringSearch {
+    /// Search keyrings in order until entry is found.
+    pub fn new(service: &str, credential_name: &str) -> Self {
+        Self {
+            keyrings: vec![Keyring::User], // Default: user only
+            service: service.into(),
+            credential_name: credential_name.into(),
+            config_key: None,
+            profile: None,
+        }
+    }
+    
+    /// Add a keyring to the search path.
+    pub fn also(mut self, keyring: Keyring) -> Self {
+        self.keyrings.push(keyring);
+        self
+    }
+    
+    /// Search user keyring, then system keyring.
+    pub fn user_then_system(self) -> Self {
+        Self {
+            keyrings: vec![Keyring::User, Keyring::System],
+            ..self
+        }
+    }
+    
+    /// Search system keyring, then user keyring.
+    pub fn system_then_user(self) -> Self {
+        Self {
+            keyrings: vec![Keyring::System, Keyring::User],
+            ..self
+        }
+    }
+    
+    pub fn as_key(self, key: &str) -> Self;
+    pub fn with_profile(self, profile: Profile) -> Self;
 }
 ```
 
-### Configuration Mapping
+### Search Usage
 
 ```rust
-// Keyring entry: service="myapp", credential_name="prod_api_key"
-// Config key defaults to credential_name:
-KeyringProvider::new("myapp", "prod_api_key")
-// → { "prod_api_key": "secret_value" }
+// Search user keyring only (default)
+KeyringSearch::new("myapp", "api_key")
 
-// Explicit key mapping:
-KeyringProvider::new("myapp", "prod_api_key")
-    .as_key("api_key")
-// → { "api_key": "secret_value" }
+// Search user first, fall back to system
+KeyringSearch::new("myapp", "api_key").user_then_system()
+
+// Custom search order
+KeyringSearch::new("myapp", "api_key")
+    .also(Keyring::Named("team".into()))
+    .also(Keyring::System)
 ```
 
-### Layer Integration
+---
 
-Providers merged later override earlier values. Typical patterns:
+## Figment-Configured Keyring Selection
+
+The keyring search path itself can be configured via Figment, enabling deployment-specific keyring selection:
+
+### Configuration Schema
 
 ```rust
-// Pattern A: Keyring as secure fallback (env takes precedence)
+#[derive(Deserialize)]
+pub struct KeyringConfig {
+    /// Which keyrings to search, in order
+    /// Default: ["user"]
+    #[serde(default = "default_keyrings")]
+    pub keyrings: Vec<String>,
+}
+
+fn default_keyrings() -> Vec<String> {
+    vec!["user".into()]
+}
+```
+
+### Config File
+
+```toml
+# config.toml
+[secrets]
+keyrings = ["user", "system"]  # Search user first, then system
+
+# Or for a shared server:
+# keyrings = ["system"]
+```
+
+### Integration
+
+```rust
+// Load keyring config from Figment, then use it to configure secret retrieval
+let base_config: KeyringConfig = Figment::new()
+    .merge(File::from("config.toml"))
+    .merge(Env::prefixed("MYAPP_SECRETS_"))
+    .extract()?;
+
+// Build keyring search from config
+let keyrings: Vec<Keyring> = base_config.keyrings
+    .iter()
+    .map(|s| match s.as_str() {
+        "user" => Keyring::User,
+        "system" => Keyring::System,
+        name => Keyring::Named(name.into()),
+    })
+    .collect();
+
+// Now load secrets using configured keyrings
+let config: AppConfig = Figment::new()
+    .merge(File::from("config.toml"))
+    .merge(KeyringSearch::new("myapp", "api_key")
+        .with_keyrings(keyrings.clone()))
+    .merge(KeyringSearch::new("myapp", "db_password")
+        .with_keyrings(keyrings))
+    .extract()?;
+```
+
+---
+
+## Layer Integration
+
+```rust
+// Pattern A: User keyring as secure fallback
 Figment::new()
     .merge(File::from("config.toml"))
     .merge(KeyringProvider::new("myapp", "api_key").optional())
     .merge(Env::prefixed("MYAPP_"))
     .extract()?;
 
-// Pattern B: Keyring as authoritative source for secrets
+// Pattern B: Search user then system, env overrides all
 Figment::new()
     .merge(File::from("config.toml"))
+    .merge(KeyringSearch::new("myapp", "api_key").user_then_system())
     .merge(Env::prefixed("MYAPP_"))
-    .merge(KeyringProvider::new("myapp", "api_key"))
+    .extract()?;
+
+// Pattern C: System keyring for shared server deployments
+Figment::new()
+    .merge(File::from("config.toml"))
+    .merge(KeyringProvider::new("myapp", "api_key").system())
     .extract()?;
 ```
 
-### Error Handling
+---
 
-Errors are categorized by recoverability:
+## Error Handling
 
-| Error Type | Behavior | Figment2 Mapping |
-|------------|----------|------------------|
-| Entry not found | Recoverable if `.optional()` | `Missing` kind |
-| Permission denied | Fatal (security issue) | Custom error with context |
-| Keyring unavailable | Recoverable if `.optional()` | `Missing` kind with warning |
-| Backend error | Fatal | Custom error with context |
+| Error Type | Behavior | Notes |
+|------------|----------|-------|
+| Entry not found | Recoverable if `.optional()` | For KeyringSearch, tries next keyring first |
+| Permission denied | Fatal | Security issue, especially for system keyring |
+| Keyring unavailable | Recoverable if `.optional()` | Common in headless environments |
+| Backend error | Fatal | Platform-specific failures |
 
-```rust
-// Optional: missing entry is not an error
-KeyringProvider::new("myapp", "optional_key").optional()
+For `KeyringSearch`, "not found" means not found in **any** of the searched keyrings.
 
-// Required (default): missing entry fails configuration
-KeyringProvider::new("myapp", "required_key")
-```
+---
 
-### Profile Support
-
-By default, keyring values appear under the default profile. Use `.with_profile()` to target specific profiles:
+## Profile Support
 
 ```rust
 // Same secret, different profiles
@@ -123,151 +282,115 @@ Figment::new()
         .with_profile(Profile::Prod))
 ```
 
-### Thread Safety
+---
 
-`KeyringProvider` is `Send + Sync`. The underlying `keyring` crate handles platform-specific synchronization. Multiple providers can be created and used across threads safely.
+## Platform Keyring Mapping
+
+| `Keyring` variant | macOS | Linux | Windows |
+|-------------------|-------|-------|---------|
+| `User` | Login Keychain | User's Secret Service collection | User's Credential Manager |
+| `System` | System Keychain | System Secret Service | Local Machine credentials |
+| `Named(x)` | Keychain file `x` | Collection named `x` | Target named `x` |
 
 ---
 
-## Multi-Secret Convenience (Optional)
-
-For applications with many secrets, a batch constructor reduces verbosity:
-
-```rust
-KeyringProvider::multi("myapp", &["api_key", "db_password", "jwt_secret"])
-// Equivalent to three separate providers merged together
-// → { "api_key": "...", "db_password": "...", "jwt_secret": "..." }
-```
-
-**Partial failure semantics**: If any entry is missing, the entire provider fails unless all entries are marked optional via a separate `.all_optional()` method.
-
-**Open question**: Is this complexity worth it? Multiple `.merge()` calls are idiomatic Figment2.
-
----
-
-## Platform Support
-
-### Supported Backends
-
-| Platform | Backend | Notes |
-|----------|---------|-------|
-| macOS | Keychain | May prompt for access |
-| Linux | Secret Service (libsecret) | Requires gnome-keyring or kwallet |
-| Windows | Credential Manager | |
-
-### Headless Environments
-
-System keyrings typically require a user session. In environments without one:
+## Headless Environments
 
 | Environment | Recommendation |
 |-------------|----------------|
-| CI/CD | Use environment variables; keyring provider with `.optional()` |
-| Docker | Mount secrets as files or use env vars |
-| Systemd services | Use `systemd-creds` or environment files |
-| SSH without agent | Use env vars or file-based secrets |
+| CI/CD | Use env vars; keyring with `.optional()` |
+| Docker | Mount secrets or use env vars |
+| Systemd services | System keyring may work; test carefully |
+| SSH without session | Use env vars or file-based secrets |
 
-```rust
-// Graceful degradation for headless:
-Figment::new()
-    .merge(KeyringProvider::new("myapp", "api_key").optional())
-    .merge(Env::prefixed("MYAPP_"))  // Fallback in headless
-```
+---
 
-### Entry Management
-
-Users must populate keyring entries before application use:
+## Entry Management
 
 ```bash
-# macOS
-security add-generic-password -s myapp -a api_key -w "secret_value"
+# macOS - User keychain
+security add-generic-password -s myapp -a api_key -w "secret"
 
-# Linux (secret-tool)
+# macOS - System keychain
+sudo security add-generic-password -s myapp -a api_key -w "secret" \
+    /Library/Keychains/System.keychain
+
+# Linux - User collection
 secret-tool store --label='myapp api_key' service myapp username api_key
 
-# Windows (PowerShell)
-cmdkey /generic:myapp:api_key /user:api_key /pass:secret_value
+# Linux - System (requires root or appropriate group)
+# Platform-specific; may need to configure Secret Service
+
+# Windows - User
+cmdkey /generic:myapp:api_key /user:api_key /pass:secret
 ```
 
 ---
 
 ## Testing Strategy
 
-### Unit Tests
-
-Use a mock keyring backend via feature flag:
+### Mock Backend
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
     
+    fn mock_keyrings() -> MockKeyringSet {
+        let mut mocks = MockKeyringSet::new();
+        mocks.user.set("myapp", "api_key", "user_secret");
+        mocks.system.set("myapp", "api_key", "system_secret");
+        mocks
+    }
+    
     #[test]
-    fn retrieves_value_from_keyring() {
-        let mock = MockKeyring::new();
-        mock.set("myapp", "api_key", "test_secret");
-        
+    fn user_keyring_is_default() {
+        let mocks = mock_keyrings();
         let provider = KeyringProvider::new("myapp", "api_key")
-            .with_backend(mock);
+            .with_backend(mocks);
         
         let data = provider.data().unwrap();
-        assert_eq!(data[&Profile::Default]["api_key"], "test_secret");
+        assert_eq!(data[&Profile::Default]["api_key"], "user_secret");
     }
     
     #[test]
-    fn optional_returns_empty_on_missing() {
-        let mock = MockKeyring::new(); // Empty
-        
-        let provider = KeyringProvider::new("myapp", "missing")
-            .optional()
-            .with_backend(mock);
+    fn search_respects_order() {
+        let mocks = mock_keyrings();
+        let provider = KeyringSearch::new("myapp", "api_key")
+            .system_then_user()
+            .with_backend(mocks);
         
         let data = provider.data().unwrap();
-        assert!(data.is_empty());
-    }
-    
-    #[test]
-    fn required_fails_on_missing() {
-        let mock = MockKeyring::new();
-        
-        let provider = KeyringProvider::new("myapp", "missing")
-            .with_backend(mock);
-        
-        assert!(provider.data().is_err());
+        assert_eq!(data[&Profile::Default]["api_key"], "system_secret");
     }
 }
 ```
 
-### Integration Tests
+---
 
-Platform-specific tests with real keyring, gated by feature or environment:
+## Future: Lazy Provider (Secondary Objective)
+
+A lazy provider defers keyring access until the value is actually used:
 
 ```rust
-#[cfg(all(test, feature = "integration-tests"))]
-mod integration {
-    #[test]
-    #[ignore] // Run manually: cargo test --features integration-tests -- --ignored
-    fn real_keyring_roundtrip() {
-        // Requires keyring entry to exist
+pub struct LazyKeyringProvider {
+    // ... same fields as KeyringProvider
+}
+
+impl Provider for LazyKeyringProvider {
+    fn data(&self) -> Result<Map<Profile, Dict>, Error> {
+        // Returns a placeholder that triggers keyring access on deserialization
+        // Requires custom Figment2 Value type or serde integration
     }
 }
 ```
 
-### CI Configuration
+**Use cases**:
+- Avoid keyring prompts for unused secrets
+- Reduce startup latency
+- Support optional secrets without `.optional()` semantics
 
-```yaml
-# GitHub Actions example
-jobs:
-  test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run unit tests (mock keyring)
-        run: cargo test
-      # Integration tests skipped in CI (no keyring session)
-```
+**Complexity**: Requires deeper Figment2/serde integration. Defer to v2.
 
 ---
 
@@ -276,47 +399,23 @@ jobs:
 ```toml
 [dependencies]
 figment2 = "0.10"
-keyring = "3"  # Specify major version for API stability
+keyring = "3"
 
 [dev-dependencies]
-# Mock keyring for testing - implementation TBD
+# Mock keyring - implementation TBD
 ```
-
----
-
-## Security Considerations
-
-1. **Plaintext in memory**: After retrieval, secrets exist as `String` in memory. Same exposure as environment variables.
-
-2. **No in-memory protection**: No `secrecy` crate integration. Complexity tradeoff; applications needing this should wrap values themselves.
-
-3. **Logging**: Provider never logs secret values. Errors include service/credential_name but never the secret.
-
-4. **Access prompts**: macOS Keychain may prompt users for access. Document this for CLI applications.
 
 ---
 
 ## Open Questions
 
-1. **Batch API partial failure**: If `KeyringProvider::multi()` is implemented, what happens when some entries exist and others don't?
+1. **Named keyring portability**: How do named keyrings map across platforms? Should we document platform-specific behavior?
 
-2. **Reload mechanism**: Should long-running applications be able to refresh keyring values? Or is this out of scope for Figment2's startup-time model?
+2. **System keyring permissions**: What's the recommended way to grant app access to system keyring on each platform?
 
-3. **Namespace prefix**: Should `.with_namespace("secrets")` be v1 to prevent key collisions with file configs?
+3. **Lazy provider design**: What's the best integration point with Figment2 for deferred secret loading?
 
-4. **Default service name**: Should there be a `KeyringProvider::for_crate()` that uses the crate name as service?
-
----
-
-## Alternatives Considered
-
-| Alternative | Why Not |
-|-------------|---------|
-| `MYAPP_API_KEY_FILE` env var | Requires file management; keyring is simpler for single-user apps |
-| HashiCorp Vault | External service dependency; overkill for local development |
-| age/sops encrypted files | Requires key management; keyring uses OS-level auth |
-
-System keyring is the right choice for desktop applications and development environments where OS-level credential storage is available and appropriate.
+4. **Batch API**: Is `KeyringSearch::multi(service, &[names])` worth the complexity?
 
 ---
 
@@ -324,29 +423,26 @@ System keyring is the right choice for desktop applications and development envi
 
 ### P0 (Required for v0.1)
 
-- [ ] `KeyringProvider::new(service, credential_name)`
-- [ ] `.as_key(key)` for config key remapping
-- [ ] `.optional()` for graceful missing-entry handling
-- [ ] `.with_profile(profile)` for profile targeting
-- [ ] Distinguishable error types (missing vs permission vs unavailable)
-- [ ] `Send + Sync` implementation
+- [ ] `Keyring` enum (User, System, Named)
+- [ ] `KeyringProvider` with `.system()` and `.keyring()`
+- [ ] User keyring as default
+- [ ] `.as_key()`, `.optional()`, `.with_profile()`
+- [ ] Distinguishable error types
 - [ ] Mock keyring backend for testing
-- [ ] Platform entry management docs
 
 ### P1 (Should have for v0.1)
 
+- [ ] `KeyringSearch` for multi-keyring search
+- [ ] `.user_then_system()` and `.system_then_user()` conveniences
 - [ ] Headless environment documentation
-- [ ] Security considerations in README
-- [ ] CI configuration examples
+- [ ] Platform keyring mapping documentation
 
 ### P2 (Nice to have)
 
-- [ ] `KeyringProvider::multi()` batch API
-- [ ] `.with_namespace()` for key prefixing
+- [ ] Figment-configured keyring selection example
+- [ ] `KeyringSearch::multi()` batch API
 - [ ] Performance benchmarks
 
-### Out of Scope
+### Future (v2)
 
-- Entry discovery (security risk)
-- Runtime secret rotation (use Vault for this)
-- In-memory value caching (premature optimization)
+- [ ] `LazyKeyringProvider` for deferred access
