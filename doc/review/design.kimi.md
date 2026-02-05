@@ -2,7 +2,8 @@
 
 **Document Reviewed:** `doc/design.md`  
 **Date:** 2026-02-05  
-**Reviewer:** Kimi
+**Reviewer:** Kimi  
+**Cross-Review:** Synthesized with reviews by Opus and GLM
 
 ---
 
@@ -10,7 +11,40 @@
 
 The design proposes a sound approach to bridging system keyrings with Figment2's configuration system. The architecture is well-considered and leverages Figment2's provider model effectively. However, several areas require attention before implementation: configuration ergonomics, error handling granularity, and the "single value per provider" limitation need refinement.
 
+Three independent reviews (Opus, GLM, and this review) identified consistent critical concerns around error handling, testing strategy, and API ergonomics, strengthening confidence in these recommendations.
+
 **Recommendation:** Proceed with implementation after addressing the concerns in this review.
+
+---
+
+## Cross-Review Synthesis
+
+This review incorporates insights from three independent analyses:
+
+**All three reviewers identified:**
+- Error handling semantics need clarification (missing entries vs unavailable service)
+- Testing strategy is missing and critical
+- Profile support in `data()` return type is unexplained
+- Optional/fallback semantics not addressed
+- Username→config key mapping needs explicit documentation
+
+**Opus review identified:**
+- Username→config key mapping is implicit magic
+- Headless/service environment concerns (CI/CD, Docker, systemd)
+- Multi-secret convenience constructor suggestion
+- **Bug:** Backwards precedence comment in usage example (line 93)
+
+**GLM review identified:**
+- Thread safety not addressed
+- Namespace support should be elevated to v1 (not future enhancement)
+- Platform-specific behavior documentation needed
+- Keyring crate version constraints
+
+**This review identified:**
+- Batch retrieval API for reducing verbosity
+- Secret rotation and audit logging considerations
+- Keyring entry creation/permissions discussion
+- Alternative approaches not considered
 
 ---
 
@@ -23,9 +57,29 @@ The design proposes a sound approach to bridging system keyrings with Figment2's
 - **Layered approach:** Using keyring as a fallback rather than primary source demonstrates good security hygiene
 - **Cross-platform:** Leveraging the `keyring` crate is the right choice for platform support
 
-**Concerns:**
+**Critical Bug Found:**
 
-#### 1.1 Single Value Per Provider Limitation
+#### 1.1 Usage Example Precedence Error (Line 93)
+
+The usage example comment says "Keyring fallback" but the keyring provider is merged last, giving it **highest** precedence, not lowest:
+
+```rust
+// CURRENT (INCORRECT):
+Figment::new()
+    .merge(File::from("config.toml"))           // Base config
+    .merge(Env::prefixed("MYAPP_"))             // Env overrides
+    .merge(KeyringProvider::new("myapp", "api_key"))  // Keyring fallback ← WRONG
+
+// CORRECTED:
+Figment::new()
+    .merge(File::from("config.toml"))           // Base config
+    .merge(KeyringProvider::new("myapp", "api_key"))  // Keyring overrides
+    .merge(Env::prefixed("MYAPP_"))             // Env has highest precedence
+```
+
+Or swap the order to match the comment's intent.
+
+#### 1.2 Single Value Per Provider Limitation
 
 The current design requires one `KeyringProvider` instance per secret:
 
@@ -43,7 +97,7 @@ KeyringProvider::for_service("myapp")
 
 This would retrieve all entries in one provider call, reducing keyring access overhead and improving ergonomics.
 
-#### 1.2 Configuration Key Naming
+#### 1.3 Configuration Key Naming
 
 The design maps `username` directly to the configuration key name. This conflates two different concerns:
 - **Keyring entry name:** The identifier for the credential in the keyring
@@ -72,6 +126,15 @@ The design doesn't address how entries are created or what permissions they shou
 - What access control should entries have?
 - Should the library provide a CLI tool for entry management?
 
+Example platform commands should be documented:
+```bash
+# macOS
+security add-generic-password -s myapp -a api_key -w "secret"
+
+# Linux (secret-tool)
+secret-tool store --label='myapp api_key' service myapp username api_key
+```
+
 #### 2.2 Secret Rotation Support
 
 How does an application handle keyring entry updates at runtime? The design states "Keyring values are retrieved once at configuration loading" - this is correct for startup, but consider:
@@ -81,7 +144,7 @@ How does an application handle keyring entry updates at runtime? The design stat
 #### 2.3 Audit Logging
 
 System keyrings often provide audit trails. Should the provider:
-- Log access events (at appropriate levels)?
+- Log access events at DEBUG level?
 - Distinguish between cache hits and actual keyring access?
 
 ### 3. Error Handling
@@ -139,9 +202,31 @@ The provider signature shows it returns `BTreeMap<Profile, BTreeMap<String, Valu
 
 This should be explicitly addressed or documented as not supported.
 
-### 5. Future Enhancements Analysis
+### 5. Thread Safety (Identified by GLM)
 
-#### 5.1 JSON Secrets (Mentioned)
+The design doesn't address thread safety. Figment2's `Figment::new().merge(...)` chain can be used across threads.
+
+**Recommendation:**
+- Explicitly document thread safety guarantees
+- If `KeyringProvider` is not `Send`/`Sync`, document restriction
+- Consider using `Arc` for shared provider instances
+- Document behavior of `data()` call under concurrent access
+
+### 6. Future Enhancements Analysis
+
+#### 6.1 Namespace Support (Should be v1, not Future)
+
+The design lists namespace support as a future enhancement. **GLM makes a strong case to elevate this to v1:** without namespace support, keyring keys could conflict with config file keys:
+
+```rust
+KeyringProvider::new("myapp", "api_key")
+    .with_namespace("secrets")
+// Produces: { "secrets.api_key": "..." }
+```
+
+This prevents accidental collisions between keyring secrets and file-based configuration.
+
+#### 6.2 JSON Secrets (Mentioned)
 
 The future enhancement suggests JSON parsing. This is valuable but introduces complexity:
 - What if JSON is malformed?
@@ -150,7 +235,7 @@ The future enhancement suggests JSON parsing. This is valuable but introduces co
 
 Consider whether this should be in scope or left to applications to handle.
 
-#### 5.2 Entry Discovery (Mentioned)
+#### 6.3 Entry Discovery (Mentioned)
 
 Automatic discovery is listed as a future enhancement. This has significant security implications:
 - Could accidentally expose entries the app shouldn't see
@@ -159,15 +244,15 @@ Automatic discovery is listed as a future enhancement. This has significant secu
 
 If implemented, it should require explicit opt-in and perhaps filtering patterns.
 
-### 6. Implementation Details
+### 7. Implementation Details
 
-#### 6.1 Dependencies
+#### 7.1 Dependencies
 
 The design lists minimal dependencies. Verify:
-- Whether `keyring` crate version constraints are compatible with Figment2
+- Whether `keyring` crate version constraints are compatible with Figment2 (Opus notes API differences between keyring 1.x and 2.x)
 - If any additional error handling crates are needed (e.g., `thiserror`)
 
-#### 6.2 Testing Strategy
+#### 7.2 Testing Strategy
 
 Not mentioned in the design. Testing keyring code is challenging because:
 - Requires system keyring access
@@ -179,7 +264,33 @@ Recommend documenting a testing approach, possibly using:
 - Integration tests with real keyring (conditional compilation)
 - CI configuration for testing on different platforms
 
-### 7. Documentation Gaps
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(feature = "mock-keyring")]
+    use mock_keyring::MockKeyring;
+
+    #[test]
+    fn test_retrieves_single_value() { /* ... */ }
+    #[test]
+    fn test_handles_missing_entry_gracefully() { /* ... */ }
+    #[test]
+    fn test_optional_secret_skips_on_missing() { /* ... */ }
+}
+```
+
+### 8. Headless/Service Environment Concerns (Opus)
+
+System keyrings often require user session context. The design should address:
+- CI/CD pipelines
+- Systemd services
+- Docker containers
+- SSH sessions without agent forwarding
+
+**Recommendation:** Document failure modes and recommend alternatives (env vars, file providers) for these contexts.
+
+### 9. Documentation Gaps
 
 The following should be added to the design or implementation:
 
@@ -188,7 +299,7 @@ The following should be added to the design or implementation:
 3. **Security Checklist:** Best practices for operators deploying apps using this
 4. **Performance Notes:** Keyring access can be slow (especially on first access) - document expected latency
 
-### 8. Alternative Approaches Considered?
+### 10. Alternative Approaches Considered?
 
 The design doesn't discuss alternatives. For completeness, consider mentioning:
 - **Environment variables with prefix:** Why not just `MYAPP_API_KEY_FILE` pointing to a secrets file?
@@ -203,25 +314,30 @@ Briefly explaining why system keyring was chosen over these alternatives would s
 
 ### Must-Have Before Implementation
 
-1. **Clarify error handling:** Specify behavior for missing entries and distinguishable error types
-2. **Add configuration key mapping:** Support renaming keyring entries to configuration keys
-3. **Document testing approach:** How will this be tested across platforms?
+1. **Fix usage example precedence:** Correct the "fallback" comment or reorder the merge chain
+2. **Clarify error handling:** Specify behavior for missing entries and distinguishable error types
+3. **Add configuration key mapping:** Support renaming keyring entries to configuration keys via `.map_to()` or `.as_key()`
+4. **Document testing approach:** How will this be tested across platforms? Include mock backend strategy
+5. **Clarify Profile support:** Explicitly document whether profiles are supported
 
-### Should-Have
+### Should-Have (Aim for v1)
 
-4. **Batch retrieval API:** Support retrieving multiple entries in one provider
-5. **Optional secrets:** Allow marking secrets as optional with fallback behavior
-6. **Security documentation:** Add operator setup and security checklist
+6. **Namespace support:** Prevent key collisions between keyring and file configs
+7. **Batch retrieval API:** Support retrieving multiple entries in one provider
+8. **Optional secrets:** Allow marking secrets as optional with fallback behavior
+9. **Thread safety documentation:** Document `Send`/`Sync` guarantees
+10. **Security documentation:** Add operator setup and security checklist
+11. **Headless environment guidance:** Document CI/CD and Docker limitations
 
 ### Nice-to-Have
 
-7. **Profile support:** Clarify or implement profile-aware keyring access
-8. **Performance benchmarks:** Measure keyring access overhead
-9. **CLI tool:** Helper for managing keyring entries during development
+12. **Profile-aware keyring access:** Support per-profile secrets
+13. **Performance benchmarks:** Measure keyring access overhead
+14. **CLI tool:** Helper for managing keyring entries during development
 
 ### Reconsider
 
-10. **Entry discovery:** Automatic discovery has security risks; consider whether this should be implemented
+15. **Entry discovery:** Automatic discovery has security risks; consider whether this should be implemented
 
 ---
 
@@ -232,6 +348,7 @@ Briefly explaining why system keyring was chosen over these alternatives would s
 3. Should secrets support Figment2 profiles (dev/staging/production), and if so, how?
 4. Is there a plan for handling keyring service unavailability (e.g., headless servers without keyring)?
 5. What's the testing strategy for CI/CD environments that may not have system keyrings available?
+6. What keyring crate version should be targeted (1.x or 2.x)?
 
 ---
 
@@ -239,6 +356,6 @@ Briefly explaining why system keyring was chosen over these alternatives would s
 
 The design is solid and addresses a real need in the Figment2 ecosystem. The architecture decisions are sound, particularly the integration with Figment2's provider model. The primary concerns are around ergonomics (single value limitation), error handling granularity, and operational concerns (entry setup, permissions, testing).
 
-With the recommendations above addressed, this design should result in a clean, secure, and maintainable implementation.
+Three independent reviews converged on the same critical issues, strengthening confidence in these recommendations. The cross-review synthesis ensures comprehensive coverage of API design, security, operations, and edge cases.
 
 **Status:** Approve with revisions
