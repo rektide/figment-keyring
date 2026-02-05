@@ -24,13 +24,72 @@ System keyrings offer encryption at rest, session-based access control, and OS-l
 
 ---
 
+## Architecture Overview
+
+```mermaid
+classDiagram
+    direction TB
+    
+    class Figment {
+        +merge(provider) Figment
+        +extract~T~() Result~T~
+    }
+    
+    class Provider {
+        <<trait>>
+        +metadata() Metadata
+        +data() Result~Map~
+    }
+    
+    class Keyring {
+        <<enum>>
+        User
+        System
+        Named(String)
+        +named(name) Keyring
+    }
+    
+    class KeyringProvider {
+        -keyring: Keyring
+        -service: String
+        -credential_name: String
+        -config_key: Option~String~
+        -optional: bool
+        +new(service, credential_name) Self
+        +from_keyring(keyring, service, credential_name) Self
+        +system() Self
+        +named(name) Self
+        +as_key(key) Self
+        +optional() Self
+    }
+    
+    class KeyringSearch {
+        -keyrings: Vec~Keyring~
+        -service: String
+        -credential_name: String
+        +new(service, credential_name) Self
+        +with_keyrings(keyrings, service, credential_name) Self
+        +also(keyring) Self
+        +also_named(name) Self
+        +user_then_system() Self
+    }
+    
+    Provider <|.. KeyringProvider : implements
+    Provider <|.. KeyringSearch : implements
+    KeyringProvider --> Keyring : uses
+    KeyringSearch --> "*" Keyring : searches
+    Figment --> Provider : merges
+```
+
+---
+
 ## Core API
 
 ### Keyring Selection
 
 ```rust
 /// Identifies which keyring backend to use.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Keyring {
     /// Current user's keyring (default, most common)
     User,
@@ -43,6 +102,23 @@ pub enum Keyring {
 impl Default for Keyring {
     fn default() -> Self {
         Keyring::User
+    }
+}
+
+impl Keyring {
+    /// Create a named keyring.
+    pub fn named(name: impl Into<String>) -> Self {
+        Keyring::Named(name.into())
+    }
+}
+
+impl From<&str> for Keyring {
+    fn from(s: &str) -> Self {
+        match s {
+            "user" => Keyring::User,
+            "system" => Keyring::System,
+            name => Keyring::Named(name.into()),
+        }
     }
 }
 ```
@@ -64,11 +140,17 @@ impl KeyringProvider {
     /// Uses the user keyring by default.
     pub fn new(service: &str, credential_name: &str) -> Self;
     
+    /// Create a provider using a specific keyring.
+    pub fn from_keyring(keyring: impl Into<Keyring>, service: &str, credential_name: &str) -> Self;
+    
     /// Use the system keyring instead of user keyring.
     pub fn system(self) -> Self;
     
-    /// Use a specific named keyring.
-    pub fn keyring(self, keyring: Keyring) -> Self;
+    /// Use a named keyring.
+    pub fn named(self, name: impl Into<String>) -> Self;
+    
+    /// Use a specific keyring.
+    pub fn keyring(self, keyring: impl Into<Keyring>) -> Self;
     
     /// Map keyring entry to a different config key name.
     pub fn as_key(self, key: &str) -> Self;
@@ -90,9 +172,54 @@ KeyringProvider::new("myapp", "api_key")
 // Explicit system keyring
 KeyringProvider::new("myapp", "shared_secret").system()
 
-// Named keyring
+// Named keyring - team shared keyring
+KeyringProvider::new("myapp", "api_key").named("team-secrets")
+
+// Named keyring - alternative syntax
+KeyringProvider::from_keyring("team-secrets", "myapp", "api_key")
+
+// Named keyring - explicit enum
 KeyringProvider::new("myapp", "api_key")
-    .keyring(Keyring::Named("login".into()))
+    .keyring(Keyring::named("team-secrets"))
+```
+
+### KeyringProvider Flow
+
+```mermaid
+flowchart LR
+    subgraph KeyringProvider
+        KP[KeyringProvider::new]
+        KP -->|".system()"| SYS[System Keyring]
+        KP -->|".named('x')"| NAMED[Named Keyring 'x']
+        KP -->|default| USER[User Keyring]
+    end
+    
+    USER --> LOOKUP[Lookup Entry]
+    SYS --> LOOKUP
+    NAMED --> LOOKUP
+    
+    LOOKUP -->|found| VALUE[Return Value]
+    LOOKUP -->|not found| CHECK{".optional()?"}
+    CHECK -->|yes| EMPTY[Return Empty]
+    CHECK -->|no| ERROR[Return Error]
+```
+
+### Named Keyring Examples
+
+Named keyrings enable team/project-specific credential collections:
+
+```rust
+// Development team's shared secrets
+KeyringProvider::new("myapp", "staging_api_key")
+    .named("dev-team")
+
+// Production secrets in isolated keyring
+KeyringProvider::new("myapp", "prod_api_key")
+    .named("prod-secrets")
+
+// Per-project keyrings
+KeyringProvider::new("myapp", "db_password")
+    .named("project-alpha")
 ```
 
 ---
@@ -114,37 +241,27 @@ pub struct KeyringSearch {
 
 impl KeyringSearch {
     /// Search keyrings in order until entry is found.
-    pub fn new(service: &str, credential_name: &str) -> Self {
-        Self {
-            keyrings: vec![Keyring::User], // Default: user only
-            service: service.into(),
-            credential_name: credential_name.into(),
-            config_key: None,
-            profile: None,
-        }
-    }
+    /// Default: searches user keyring only.
+    pub fn new(service: &str, credential_name: &str) -> Self;
+    
+    /// Create with explicit keyring list.
+    pub fn with_keyrings(
+        keyrings: impl IntoIterator<Item = impl Into<Keyring>>,
+        service: &str,
+        credential_name: &str,
+    ) -> Self;
     
     /// Add a keyring to the search path.
-    pub fn also(mut self, keyring: Keyring) -> Self {
-        self.keyrings.push(keyring);
-        self
-    }
+    pub fn also(self, keyring: impl Into<Keyring>) -> Self;
+    
+    /// Add a named keyring to the search path.
+    pub fn also_named(self, name: impl Into<String>) -> Self;
     
     /// Search user keyring, then system keyring.
-    pub fn user_then_system(self) -> Self {
-        Self {
-            keyrings: vec![Keyring::User, Keyring::System],
-            ..self
-        }
-    }
+    pub fn user_then_system(self) -> Self;
     
     /// Search system keyring, then user keyring.
-    pub fn system_then_user(self) -> Self {
-        Self {
-            keyrings: vec![Keyring::System, Keyring::User],
-            ..self
-        }
-    }
+    pub fn system_then_user(self) -> Self;
     
     pub fn as_key(self, key: &str) -> Self;
     pub fn with_profile(self, profile: Profile) -> Self;
@@ -160,10 +277,70 @@ KeyringSearch::new("myapp", "api_key")
 // Search user first, fall back to system
 KeyringSearch::new("myapp", "api_key").user_then_system()
 
-// Custom search order
+// User → named team keyring → system
 KeyringSearch::new("myapp", "api_key")
-    .also(Keyring::Named("team".into()))
+    .also_named("team-secrets")
     .also(Keyring::System)
+
+// Named keyrings only (no user/system)
+KeyringSearch::with_keyrings(
+    ["project-alpha", "shared-secrets"],
+    "myapp",
+    "api_key",
+)
+
+// Complex search path from config
+let keyrings = vec!["user", "team-secrets", "org-secrets", "system"];
+KeyringSearch::with_keyrings(keyrings, "myapp", "api_key")
+```
+
+### Search Order Patterns
+
+```rust
+// Personal dev overrides → team defaults → org defaults
+KeyringSearch::new("myapp", "api_key")
+    .also_named("team-secrets")
+    .also_named("org-secrets")
+
+// Project-specific → user fallback
+KeyringSearch::with_keyrings(["project-alpha"], "myapp", "db_password")
+    .also(Keyring::User)
+
+// Prod deployment: system only, no user secrets
+KeyringSearch::with_keyrings([Keyring::System], "myapp", "api_key")
+```
+
+### KeyringSearch Flow
+
+```mermaid
+flowchart TD
+    START[KeyringSearch::new] --> K1[Keyring 1]
+    K1 -->|found| DONE[Return Value]
+    K1 -->|not found| K2[Keyring 2]
+    K2 -->|found| DONE
+    K2 -->|not found| K3[Keyring 3]
+    K3 -->|found| DONE
+    K3 -->|not found| KN[... Keyring N]
+    KN -->|found| DONE
+    KN -->|not found| FAIL[All Exhausted]
+    FAIL --> ERROR[Return Error]
+```
+
+### Example: Team Development Search
+
+```mermaid
+flowchart LR
+    subgraph "KeyringSearch: user → team → org"
+        USER[(User Keyring)]
+        TEAM[(team-secrets)]
+        ORG[(org-secrets)]
+    end
+    
+    SEARCH[Search api_key] --> USER
+    USER -->|not found| TEAM
+    TEAM -->|found| RESULT[api_key = 'team_value']
+    
+    style TEAM fill:#228b22,color:#fff
 ```
 
 ---
@@ -232,6 +409,25 @@ let config: AppConfig = Figment::new()
 
 ## Layer Integration
 
+### Figment Merge Order
+
+```mermaid
+flowchart TB
+    subgraph "Figment Layer Stack"
+        direction TB
+        FILE[File Provider<br/>config.toml] -->|overridden by| KEYRING[Keyring Provider]
+        KEYRING -->|overridden by| ENV[Env Provider<br/>MYAPP_*]
+    end
+    
+    ENV --> EXTRACT[extract&lt;Config&gt;]
+    EXTRACT --> CONFIG[Final Config]
+    
+    note[Later providers override earlier]
+    style note fill:none,stroke:none
+```
+
+### Usage Patterns
+
 ```rust
 // Pattern A: User keyring as secure fallback
 Figment::new()
@@ -286,11 +482,73 @@ Figment::new()
 
 ## Platform Keyring Mapping
 
+```mermaid
+flowchart TD
+    subgraph "Keyring Enum"
+        USER[Keyring::User]
+        SYSTEM[Keyring::System]
+        NAMED["Keyring::Named(x)"]
+    end
+    
+    subgraph "macOS"
+        MAC_USER[Login Keychain]
+        MAC_SYS[System Keychain]
+        MAC_NAMED["~/Library/Keychains/x.keychain-db"]
+    end
+    
+    subgraph "Linux"
+        LIN_USER[User Secret Service]
+        LIN_SYS[System Secret Service]
+        LIN_NAMED["Collection 'x'"]
+    end
+    
+    subgraph "Windows"
+        WIN_USER[User Credential Manager]
+        WIN_SYS[Local Machine]
+        WIN_NAMED["Target 'x'"]
+    end
+    
+    USER --> MAC_USER
+    USER --> LIN_USER
+    USER --> WIN_USER
+    
+    SYSTEM --> MAC_SYS
+    SYSTEM --> LIN_SYS
+    SYSTEM --> WIN_SYS
+    
+    NAMED --> MAC_NAMED
+    NAMED --> LIN_NAMED
+    NAMED --> WIN_NAMED
+```
+
 | `Keyring` variant | macOS | Linux | Windows |
 |-------------------|-------|-------|---------|
 | `User` | Login Keychain | User's Secret Service collection | User's Credential Manager |
 | `System` | System Keychain | System Secret Service | Local Machine credentials |
-| `Named(x)` | Keychain file `x` | Collection named `x` | Target named `x` |
+| `Named(x)` | Keychain file at `~/Library/Keychains/x.keychain-db` | Secret Service collection `x` | Credential target `x` |
+
+### Named Keyring Platform Details
+
+**macOS**: Named keyrings map to keychain files. Create with:
+```bash
+security create-keychain -p "" ~/Library/Keychains/team-secrets.keychain-db
+security add-generic-password -s myapp -a api_key -w "secret" \
+    ~/Library/Keychains/team-secrets.keychain-db
+```
+
+**Linux (Secret Service)**: Named keyrings map to collections. Create with:
+```bash
+# Create collection (may require GUI or D-Bus call)
+secret-tool store --label='myapp api_key' \
+    --collection='team-secrets' \
+    service myapp username api_key
+```
+
+**Windows**: Named keyrings use credential targets:
+```powershell
+# Stored under target "team-secrets:myapp:api_key"
+cmdkey /generic:team-secrets:myapp:api_key /user:api_key /pass:secret
+```
 
 ---
 
@@ -409,13 +667,17 @@ keyring = "3"
 
 ## Open Questions
 
-1. **Named keyring portability**: How do named keyrings map across platforms? Should we document platform-specific behavior?
+1. **Named keyring creation**: Should the library provide helpers to create named keyrings, or leave this to platform tools?
 
-2. **System keyring permissions**: What's the recommended way to grant app access to system keyring on each platform?
+2. **Named keyring discovery**: Should we support listing available named keyrings? (Security implications)
 
-3. **Lazy provider design**: What's the best integration point with Figment2 for deferred secret loading?
+3. **System keyring permissions**: What's the recommended way to grant app access to system keyring on each platform?
 
-4. **Batch API**: Is `KeyringSearch::multi(service, &[names])` worth the complexity?
+4. **Lazy provider design**: What's the best integration point with Figment2 for deferred secret loading?
+
+5. **Batch API**: Is `KeyringSearch::multi(service, &[names])` worth the complexity?
+
+6. **Named keyring path flexibility**: On macOS, should we support arbitrary paths or only `~/Library/Keychains/`?
 
 ---
 
@@ -423,8 +685,9 @@ keyring = "3"
 
 ### P0 (Required for v0.1)
 
-- [ ] `Keyring` enum (User, System, Named)
-- [ ] `KeyringProvider` with `.system()` and `.keyring()`
+- [ ] `Keyring` enum (User, System, Named) with `From<&str>`
+- [ ] `KeyringProvider` with `.system()`, `.named()`, `.keyring()`
+- [ ] `KeyringProvider::from_keyring()` constructor
 - [ ] User keyring as default
 - [ ] `.as_key()`, `.optional()`, `.with_profile()`
 - [ ] Distinguishable error types
@@ -433,9 +696,11 @@ keyring = "3"
 ### P1 (Should have for v0.1)
 
 - [ ] `KeyringSearch` for multi-keyring search
+- [ ] `KeyringSearch::with_keyrings()` for explicit keyring lists
+- [ ] `.also()`, `.also_named()` for building search paths
 - [ ] `.user_then_system()` and `.system_then_user()` conveniences
+- [ ] Named keyring platform documentation (macOS/Linux/Windows)
 - [ ] Headless environment documentation
-- [ ] Platform keyring mapping documentation
 
 ### P2 (Nice to have)
 
@@ -446,3 +711,104 @@ keyring = "3"
 ### Future (v2)
 
 - [ ] `LazyKeyringProvider` for deferred access
+- [ ] Named keyring creation helpers
+
+---
+
+## Complete System Diagram
+
+```mermaid
+flowchart TB
+    subgraph "Application"
+        APP[main.rs]
+        CONFIG_STRUCT[Config struct]
+    end
+    
+    subgraph "Figment Configuration"
+        FIGMENT[Figment::new]
+        FILE_PROV[File Provider<br/>config.toml]
+        KEYRING_PROV[KeyringProvider]
+        SEARCH_PROV[KeyringSearch]
+        ENV_PROV[Env Provider]
+        
+        FIGMENT --> FILE_PROV
+        FIGMENT --> KEYRING_PROV
+        FIGMENT --> SEARCH_PROV
+        FIGMENT --> ENV_PROV
+    end
+    
+    subgraph "Keyring Layer"
+        KEYRING_ENUM[Keyring Enum]
+        
+        subgraph "Available Keyrings"
+            USER_KR[(User Keyring)]
+            SYS_KR[(System Keyring)]
+            TEAM_KR[(team-secrets)]
+            PROJ_KR[(project-alpha)]
+        end
+        
+        KEYRING_PROV --> KEYRING_ENUM
+        SEARCH_PROV --> KEYRING_ENUM
+        KEYRING_ENUM --> USER_KR
+        KEYRING_ENUM --> SYS_KR
+        KEYRING_ENUM --> TEAM_KR
+        KEYRING_ENUM --> PROJ_KR
+    end
+    
+    subgraph "Platform Backends"
+        MAC[macOS Keychain]
+        LINUX[Linux Secret Service]
+        WIN[Windows Credential Manager]
+        
+        USER_KR -.-> MAC
+        USER_KR -.-> LINUX
+        USER_KR -.-> WIN
+        SYS_KR -.-> MAC
+        SYS_KR -.-> LINUX
+        SYS_KR -.-> WIN
+        TEAM_KR -.-> MAC
+        TEAM_KR -.-> LINUX
+        TEAM_KR -.-> WIN
+    end
+    
+    APP --> FIGMENT
+    FIGMENT -->|extract| CONFIG_STRUCT
+    
+    style USER_KR fill:#228b22,color:#fff
+    style KEYRING_PROV fill:#1e90ff,color:#fff
+    style SEARCH_PROV fill:#1e90ff,color:#fff
+```
+
+### Data Flow Summary
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant Figment
+    participant KeyringProvider
+    participant Keyring as Keyring Backend
+    participant OS as OS Keyring Service
+    
+    App->>Figment: Figment::new().merge(providers)
+    App->>Figment: extract::<Config>()
+    
+    Figment->>KeyringProvider: data()
+    KeyringProvider->>Keyring: select keyring (User/System/Named)
+    Keyring->>OS: get_password(service, credential_name)
+    
+    alt Entry Found
+        OS-->>Keyring: secret_value
+        Keyring-->>KeyringProvider: Ok(secret_value)
+        KeyringProvider-->>Figment: Ok({key: value})
+    else Entry Not Found
+        OS-->>Keyring: NotFound
+        alt .optional() set
+            KeyringProvider-->>Figment: Ok({})
+        else required
+            KeyringProvider-->>Figment: Err(Missing)
+        end
+    end
+    
+    Figment->>Figment: merge all provider data
+    Figment-->>App: Ok(Config)
+```
