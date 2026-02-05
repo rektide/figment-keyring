@@ -1,114 +1,90 @@
-# Figment Keyring Provider - Revised Design
+# Figment Keyring Provider - Revised Design v3
 
 **Author**: Claude (opus)  
-**Based on**: Cross-review synthesis + author critique  
-**Status**: Draft v2
+**Based on**: Cross-review synthesis + author critique + GLM review  
+**Status**: Draft v3
 
 ---
 
 ## Problem Statement
 
-Applications need secure storage for sensitive configuration: API keys, tokens, database passwords. Plaintext storage in files or environment variables risks exposure through version control, process listings, logs, or file permissions.
+Applications need secure storage for sensitive configuration: API keys, tokens, database passwords. This provider bridges Figment2's layered configuration with system keyring storage.
 
-System keyrings offer encryption at rest, session-based access control, and OS-level credential management. This provider bridges Figment2's layered configuration with system keyring storage.
-
----
-
-## Design Goals
-
-1. **Simple primary provider** - Easy to understand and use for common cases
-2. **Multiple keyring support** - Search across user, system, or custom keyrings
-3. **Composable keyring selection** - Use Figment itself to configure which keyrings to search
-4. **User keyring by default** - Secure default; system keyring requires explicit opt-in
-5. **Lazy provider (secondary)** - Future extension for deferred secret retrieval
+**Key requirements from author critique**:
+1. Support multiple keyrings (user, system, named)
+2. Use Figment to configure which keyrings to search
+3. User and system keyrings as special easy-to-use options
+4. Default to user keyring only
+5. **Late binding**: defer configuration resolution as long as possible
+6. **Dynamic behavior**: configuration can change even at runtime
 
 ---
 
-## Architecture Overview
+## Design Philosophy
+
+### Separation of Concerns
+
+The design separates three orthogonal concerns:
+
+1. **What to fetch**: credential name, config key mapping
+2. **Where to get keyring config**: static, file, env, or Figment-based
+3. **When to resolve config**: construction time vs `.data()` time
 
 ```mermaid
-classDiagram
-    direction TB
+flowchart LR
+    subgraph "What"
+        CRED[credential_name]
+        KEY[config_key]
+    end
     
-    class Figment {
-        +merge(provider) Figment
-        +extract~T~() Result~T~
-    }
+    subgraph "Where (ConfigSource)"
+        STATIC[Static config]
+        FILE[File path]
+        ENV[Env var]
+        FIGMENT[Figment instance]
+    end
     
-    class Provider {
-        <<trait>>
-        +metadata() Metadata
-        +data() Result~Map~
-    }
+    subgraph "When"
+        EARLY[Construction time]
+        LATE[".data() time"]
+    end
     
-    class Keyring {
-        <<enum>>
-        User
-        System
-        Named(String)
-        +named(name) Keyring
-    }
-    
-    class KeyringProvider {
-        -keyring: Keyring
-        -service: String
-        -credential_name: String
-        -config_key: Option~String~
-        -optional: bool
-        +new(service, credential_name) Self
-        +from_keyring(keyring, service, credential_name) Self
-        +system() Self
-        +named(name) Self
-        +as_key(key) Self
-        +optional() Self
-    }
-    
-    class KeyringSearch {
-        -keyrings: Vec~Keyring~
-        -service: String
-        -credential_name: String
-        +new(service, credential_name) Self
-        +with_keyrings(keyrings, service, credential_name) Self
-        +also(keyring) Self
-        +also_named(name) Self
-        +user_then_system() Self
-    }
-    
-    Provider <|.. KeyringProvider : implements
-    Provider <|.. KeyringSearch : implements
-    KeyringProvider --> Keyring : uses
-    KeyringSearch --> "*" Keyring : searches
-    Figment --> Provider : merges
+    STATIC --> EARLY
+    FILE --> LATE
+    ENV --> LATE
+    FIGMENT --> EARLY
 ```
+
+### Late Binding Priority
+
+The design prioritizes late binding—resolving configuration as late as possible enables:
+- Configuration changes without restarting the application
+- Same provider working across different environments
+- Testing with different configs without rebuilding providers
 
 ---
 
-## Core API
+## Core Types
 
-### Keyring Selection
+### Keyring Enum
 
 ```rust
-/// Identifies which keyring backend to use.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Identifies which keyring to use.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Keyring {
-    /// Current user's keyring (default, most common)
+    /// Current user's keyring (default)
     User,
-    /// System-wide keyring (requires elevated permissions on some platforms)
+    /// System-wide keyring
     System,
-    /// Custom keyring by name (platform-specific interpretation)
+    /// Custom named keyring
+    #[serde(untagged)]
     Named(String),
 }
 
 impl Default for Keyring {
     fn default() -> Self {
         Keyring::User
-    }
-}
-
-impl Keyring {
-    /// Create a named keyring.
-    pub fn named(name: impl Into<String>) -> Self {
-        Keyring::Named(name.into())
     }
 }
 
@@ -123,362 +99,465 @@ impl From<&str> for Keyring {
 }
 ```
 
-### KeyringProvider
+### KeyringConfig
+
+```rust
+/// Configuration for keyring behavior.
+/// Can be deserialized from Figment, TOML, JSON, env vars, etc.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct KeyringConfig {
+    /// Application/service identifier
+    pub service: String,
+    
+    /// Keyrings to search, in priority order
+    #[serde(default = "default_keyrings")]
+    pub keyrings: Vec<Keyring>,
+    
+    /// Don't fail if secret is not found
+    #[serde(default)]
+    pub optional: bool,
+}
+
+fn default_keyrings() -> Vec<Keyring> {
+    vec![Keyring::User]
+}
+
+impl KeyringConfig {
+    pub fn new(service: impl Into<String>) -> Self {
+        Self {
+            service: service.into(),
+            keyrings: default_keyrings(),
+            optional: false,
+        }
+    }
+    
+    pub fn with_keyrings(mut self, keyrings: Vec<Keyring>) -> Self {
+        self.keyrings = keyrings;
+        self
+    }
+    
+    pub fn optional(mut self) -> Self {
+        self.optional = true;
+        self
+    }
+}
+```
+
+### ConfigSource - The Key to Late Binding
+
+```rust
+/// Where to get keyring configuration from.
+/// Determines WHEN configuration is resolved.
+#[derive(Clone, Debug)]
+pub enum ConfigSource {
+    /// Configuration is known now (resolved at construction)
+    Static(KeyringConfig),
+    
+    /// Read from TOML/JSON file at .data() time
+    File(PathBuf),
+    
+    /// Read from environment variable at .data() time
+    /// Variable should contain JSON or "service:keyring1,keyring2" format
+    Env(String),
+    
+    /// Use defaults with just a service name
+    Default { service: String },
+}
+
+impl ConfigSource {
+    /// Resolve configuration. Called at .data() time for late-bound sources.
+    fn resolve(&self) -> Result<KeyringConfig, Error> {
+        match self {
+            ConfigSource::Static(config) => Ok(config.clone()),
+            
+            ConfigSource::File(path) => {
+                let contents = std::fs::read_to_string(path)?;
+                let config: KeyringConfig = toml::from_str(&contents)?;
+                Ok(config)
+            }
+            
+            ConfigSource::Env(var_name) => {
+                let value = std::env::var(var_name)?;
+                parse_env_config(&value)
+            }
+            
+            ConfigSource::Default { service } => {
+                Ok(KeyringConfig::new(service))
+            }
+        }
+    }
+}
+```
+
+---
+
+## KeyringProvider API
+
+### Construction Patterns
 
 ```rust
 pub struct KeyringProvider {
-    keyring: Keyring,
-    service: String,
+    config_source: ConfigSource,
     credential_name: String,
     config_key: Option<String>,
     profile: Option<Profile>,
-    optional: bool,
 }
 
 impl KeyringProvider {
-    /// Create a provider for a single keyring entry.
-    /// Uses the user keyring by default.
-    pub fn new(service: &str, credential_name: &str) -> Self;
+    // === Simple construction (most common) ===
     
-    /// Create a provider using a specific keyring.
-    pub fn from_keyring(keyring: impl Into<Keyring>, service: &str, credential_name: &str) -> Self;
+    /// User keyring, default settings
+    pub fn new(service: &str, credential_name: &str) -> Self {
+        Self {
+            config_source: ConfigSource::Default { service: service.into() },
+            credential_name: credential_name.into(),
+            config_key: None,
+            profile: None,
+        }
+    }
     
-    /// Use the system keyring instead of user keyring.
-    pub fn system(self) -> Self;
+    // === Static configuration ===
     
-    /// Use a named keyring.
-    pub fn named(self, name: impl Into<String>) -> Self;
+    /// Use explicit KeyringConfig (resolved now)
+    pub fn from_config(config: KeyringConfig, credential_name: &str) -> Self {
+        Self {
+            config_source: ConfigSource::Static(config),
+            credential_name: credential_name.into(),
+            config_key: None,
+            profile: None,
+        }
+    }
     
-    /// Use a specific keyring.
-    pub fn keyring(self, keyring: impl Into<Keyring>) -> Self;
+    // === Late-bound configuration ===
     
-    /// Map keyring entry to a different config key name.
-    pub fn as_key(self, key: &str) -> Self;
+    /// Read config from file at .data() time
+    pub fn from_file(path: impl Into<PathBuf>, credential_name: &str) -> Self {
+        Self {
+            config_source: ConfigSource::File(path.into()),
+            credential_name: credential_name.into(),
+            config_key: None,
+            profile: None,
+        }
+    }
     
-    /// Target a specific Figment2 profile.
-    pub fn with_profile(self, profile: Profile) -> Self;
+    /// Read config from env var at .data() time
+    pub fn from_env(env_var: &str, credential_name: &str) -> Self {
+        Self {
+            config_source: ConfigSource::Env(env_var.into()),
+            credential_name: credential_name.into(),
+            config_key: None,
+            profile: None,
+        }
+    }
     
-    /// Don't fail if entry is missing.
-    pub fn optional(self) -> Self;
+    // === Builders ===
+    
+    /// Override which keyrings to search
+    pub fn keyrings(mut self, keyrings: Vec<Keyring>) -> Self {
+        self.config_source = match self.config_source {
+            ConfigSource::Static(mut config) => {
+                config.keyrings = keyrings;
+                ConfigSource::Static(config)
+            }
+            ConfigSource::Default { service } => {
+                ConfigSource::Static(KeyringConfig {
+                    service,
+                    keyrings,
+                    optional: false,
+                })
+            }
+            // Can't override late-bound sources at construction
+            other => other,
+        };
+        self
+    }
+    
+    /// Use system keyring instead of user
+    pub fn system(self) -> Self {
+        self.keyrings(vec![Keyring::System])
+    }
+    
+    /// Add a named keyring to search
+    pub fn also_named(mut self, name: impl Into<String>) -> Self {
+        // Modifies keyrings list to add named keyring
+        self.keyrings(self.current_keyrings_plus(Keyring::Named(name.into())))
+    }
+    
+    /// Map to different config key name
+    pub fn as_key(mut self, key: &str) -> Self {
+        self.config_key = Some(key.into());
+        self
+    }
+    
+    /// Don't fail if secret not found
+    pub fn optional(mut self) -> Self {
+        self.config_source = match self.config_source {
+            ConfigSource::Static(mut config) => {
+                config.optional = true;
+                ConfigSource::Static(config)
+            }
+            other => other,
+        };
+        self
+    }
+    
+    /// Target specific Figment profile
+    pub fn with_profile(mut self, profile: Profile) -> Self {
+        self.profile = Some(profile);
+        self
+    }
 }
 ```
 
-### Basic Usage
+### Provider Implementation
 
 ```rust
-// User keyring (default) - most common case
-KeyringProvider::new("myapp", "api_key")
-
-// Explicit system keyring
-KeyringProvider::new("myapp", "shared_secret").system()
-
-// Named keyring - team shared keyring
-KeyringProvider::new("myapp", "api_key").named("team-secrets")
-
-// Named keyring - alternative syntax
-KeyringProvider::from_keyring("team-secrets", "myapp", "api_key")
-
-// Named keyring - explicit enum
-KeyringProvider::new("myapp", "api_key")
-    .keyring(Keyring::named("team-secrets"))
-```
-
-### KeyringProvider Flow
-
-```mermaid
-flowchart LR
-    subgraph KeyringProvider
-        KP[KeyringProvider::new]
-        KP -->|".system()"| SYS[System Keyring]
-        KP -->|".named('x')"| NAMED[Named Keyring 'x']
-        KP -->|default| USER[User Keyring]
-    end
+impl Provider for KeyringProvider {
+    fn metadata(&self) -> Metadata {
+        Metadata::named("keyring")
+    }
     
-    USER --> LOOKUP[Lookup Entry]
-    SYS --> LOOKUP
-    NAMED --> LOOKUP
-    
-    LOOKUP -->|found| VALUE[Return Value]
-    LOOKUP -->|not found| CHECK{".optional()?"}
-    CHECK -->|yes| EMPTY[Return Empty]
-    CHECK -->|no| ERROR[Return Error]
-```
-
-### Named Keyring Examples
-
-Named keyrings enable team/project-specific credential collections:
-
-```rust
-// Development team's shared secrets
-KeyringProvider::new("myapp", "staging_api_key")
-    .named("dev-team")
-
-// Production secrets in isolated keyring
-KeyringProvider::new("myapp", "prod_api_key")
-    .named("prod-secrets")
-
-// Per-project keyrings
-KeyringProvider::new("myapp", "db_password")
-    .named("project-alpha")
+    fn data(&self) -> Result<Map<Profile, Dict>, Error> {
+        // Late binding: resolve config NOW
+        let config = self.config_source.resolve()?;
+        
+        // Search keyrings in order
+        let secret = self.search_keyrings(&config)?;
+        
+        // Build result map
+        let key = self.config_key.as_ref()
+            .unwrap_or(&self.credential_name);
+        
+        let profile = self.profile.clone()
+            .unwrap_or(Profile::Default);
+        
+        let mut dict = Dict::new();
+        if let Some(value) = secret {
+            dict.insert(key.clone(), Value::from(value));
+        }
+        
+        let mut map = Map::new();
+        map.insert(profile, dict);
+        Ok(map)
+    }
+}
 ```
 
 ---
 
-## Multi-Keyring Search
+## Usage Patterns
 
-### KeyringSearch Provider
-
-For searching across multiple keyrings in priority order:
+### Pattern 1: Simple (Most Common)
 
 ```rust
-pub struct KeyringSearch {
-    keyrings: Vec<Keyring>,
-    service: String,
-    credential_name: String,
-    config_key: Option<String>,
-    profile: Option<Profile>,
-}
-
-impl KeyringSearch {
-    /// Search keyrings in order until entry is found.
-    /// Default: searches user keyring only.
-    pub fn new(service: &str, credential_name: &str) -> Self;
-    
-    /// Create with explicit keyring list.
-    pub fn with_keyrings(
-        keyrings: impl IntoIterator<Item = impl Into<Keyring>>,
-        service: &str,
-        credential_name: &str,
-    ) -> Self;
-    
-    /// Add a keyring to the search path.
-    pub fn also(self, keyring: impl Into<Keyring>) -> Self;
-    
-    /// Add a named keyring to the search path.
-    pub fn also_named(self, name: impl Into<String>) -> Self;
-    
-    /// Search user keyring, then system keyring.
-    pub fn user_then_system(self) -> Self;
-    
-    /// Search system keyring, then user keyring.
-    pub fn system_then_user(self) -> Self;
-    
-    pub fn as_key(self, key: &str) -> Self;
-    pub fn with_profile(self, profile: Profile) -> Self;
-}
+// User keyring, single secret
+let config: Config = Figment::new()
+    .merge(File::from("config.toml"))
+    .merge(KeyringProvider::new("myapp", "api_key"))
+    .merge(Env::prefixed("MYAPP_"))
+    .extract()?;
 ```
 
-### Search Usage
+### Pattern 2: Static Configuration
 
 ```rust
-// Search user keyring only (default)
-KeyringSearch::new("myapp", "api_key")
+// Explicit config, resolved at construction
+let keyring_config = KeyringConfig::new("myapp")
+    .with_keyrings(vec![Keyring::User, Keyring::Named("team".into())])
+    .optional();
 
-// Search user first, fall back to system
-KeyringSearch::new("myapp", "api_key").user_then_system()
-
-// User → named team keyring → system
-KeyringSearch::new("myapp", "api_key")
-    .also_named("team-secrets")
-    .also(Keyring::System)
-
-// Named keyrings only (no user/system)
-KeyringSearch::with_keyrings(
-    ["project-alpha", "shared-secrets"],
-    "myapp",
-    "api_key",
-)
-
-// Complex search path from config
-let keyrings = vec!["user", "team-secrets", "org-secrets", "system"];
-KeyringSearch::with_keyrings(keyrings, "myapp", "api_key")
+let config: Config = Figment::new()
+    .merge(KeyringProvider::from_config(keyring_config, "api_key"))
+    .extract()?;
 ```
 
-### Search Order Patterns
+### Pattern 3: Figment-Configured (Two-Phase)
 
 ```rust
-// Personal dev overrides → team defaults → org defaults
-KeyringSearch::new("myapp", "api_key")
-    .also_named("team-secrets")
-    .also_named("org-secrets")
+// Phase 1: Extract keyring configuration from Figment
+let keyring_config: KeyringConfig = Figment::new()
+    .merge(File::from("config.toml"))
+    .extract()?;
 
-// Project-specific → user fallback
-KeyringSearch::with_keyrings(["project-alpha"], "myapp", "db_password")
-    .also(Keyring::User)
-
-// Prod deployment: system only, no user secrets
-KeyringSearch::with_keyrings([Keyring::System], "myapp", "api_key")
+// Phase 2: Use config to build provider
+let config: Config = Figment::new()
+    .merge(File::from("config.toml"))
+    .merge(KeyringProvider::from_config(keyring_config, "api_key"))
+    .extract()?;
 ```
 
-### KeyringSearch Flow
-
-```mermaid
-flowchart TD
-    START[KeyringSearch::new] --> K1[Keyring 1]
-    K1 -->|found| DONE[Return Value]
-    K1 -->|not found| K2[Keyring 2]
-    K2 -->|found| DONE
-    K2 -->|not found| K3[Keyring 3]
-    K3 -->|found| DONE
-    K3 -->|not found| KN[... Keyring N]
-    KN -->|found| DONE
-    KN -->|not found| FAIL[All Exhausted]
-    FAIL --> ERROR[Return Error]
-```
-
-### Example: Team Development Search
-
-```mermaid
-flowchart LR
-    subgraph "KeyringSearch: user → team → org"
-        USER[(User Keyring)]
-        TEAM[(team-secrets)]
-        ORG[(org-secrets)]
-    end
-    
-    SEARCH[Search api_key] --> USER
-    USER -->|not found| TEAM
-    TEAM -->|found| RESULT[api_key = 'team_value']
-    
-    style TEAM fill:#228b22,color:#fff
-```
-
----
-
-## Figment-Configured Keyring Selection
-
-The keyring search path itself can be configured via Figment, enabling deployment-specific keyring selection:
-
-### Configuration Schema
+### Pattern 4: Late-Bound File Configuration
 
 ```rust
-#[derive(Deserialize)]
-pub struct KeyringConfig {
-    /// Which keyrings to search, in order
-    /// Default: ["user"]
-    #[serde(default = "default_keyrings")]
-    pub keyrings: Vec<String>,
-}
+// Config is read from file at .data() time
+// File can change between calls!
+let provider = KeyringProvider::from_file("keyring.toml", "api_key");
 
-fn default_keyrings() -> Vec<String> {
-    vec!["user".into()]
-}
+let config: Config = Figment::new()
+    .merge(provider)
+    .extract()?;
 ```
-
-### Config File
 
 ```toml
-# config.toml
-[secrets]
-keyrings = ["user", "system"]  # Search user first, then system
-
-# Or for a shared server:
-# keyrings = ["system"]
+# keyring.toml - can be updated without restarting app
+service = "myapp"
+keyrings = ["user", "team-secrets", "system"]
+optional = true
 ```
 
-### Integration
+### Pattern 5: Environment-Driven
 
 ```rust
-// Load keyring config from Figment, then use it to configure secret retrieval
-let base_config: KeyringConfig = Figment::new()
-    .merge(File::from("config.toml"))
-    .merge(Env::prefixed("MYAPP_SECRETS_"))
-    .extract()?;
+// Config determined by environment at .data() time
+let provider = KeyringProvider::from_env("MYAPP_KEYRING_CONFIG", "api_key");
 
-// Build keyring search from config
-let keyrings: Vec<Keyring> = base_config.keyrings
-    .iter()
-    .map(|s| match s.as_str() {
-        "user" => Keyring::User,
-        "system" => Keyring::System,
-        name => Keyring::Named(name.into()),
-    })
-    .collect();
+// MYAPP_KEYRING_CONFIG=myapp:user,team-secrets
+// or
+// MYAPP_KEYRING_CONFIG={"service":"myapp","keyrings":["user","system"]}
+```
 
-// Now load secrets using configured keyrings
-let config: AppConfig = Figment::new()
+### Pattern 6: Multi-Secret with Shared Config
+
+```rust
+let keyring_config = KeyringConfig::new("myapp")
+    .with_keyrings(vec![Keyring::User, Keyring::System]);
+
+let config: Config = Figment::new()
     .merge(File::from("config.toml"))
-    .merge(KeyringSearch::new("myapp", "api_key")
-        .with_keyrings(keyrings.clone()))
-    .merge(KeyringSearch::new("myapp", "db_password")
-        .with_keyrings(keyrings))
+    .merge(KeyringProvider::from_config(keyring_config.clone(), "api_key"))
+    .merge(KeyringProvider::from_config(keyring_config.clone(), "db_password"))
+    .merge(KeyringProvider::from_config(keyring_config, "jwt_secret"))
     .extract()?;
 ```
 
 ---
 
-## Layer Integration
+## Configuration File Format
 
-### Figment Merge Order
+### TOML
+
+```toml
+# keyring.toml or [keyring] section in config.toml
+service = "myapp"
+keyrings = ["user", "team-secrets", "system"]
+optional = false
+
+# Named keyring details (future enhancement)
+[named.team-secrets]
+collection = "dev-team"
+```
+
+### JSON
+
+```json
+{
+  "service": "myapp",
+  "keyrings": ["user", "system"],
+  "optional": true
+}
+```
+
+### Environment Variable
+
+```bash
+# Simple format
+MYAPP_KEYRING_CONFIG="myapp:user,team-secrets,system"
+
+# JSON format
+MYAPP_KEYRING_CONFIG='{"service":"myapp","keyrings":["user"]}'
+```
+
+---
+
+## Architecture Diagram
 
 ```mermaid
-flowchart TB
-    subgraph "Figment Layer Stack"
-        direction TB
-        FILE[File Provider<br/>config.toml] -->|overridden by| KEYRING[Keyring Provider]
-        KEYRING -->|overridden by| ENV[Env Provider<br/>MYAPP_*]
+classDiagram
+    direction TB
+    
+    class Provider {
+        <<trait>>
+        +metadata() Metadata
+        +data() Result~Map~
+    }
+    
+    class KeyringProvider {
+        -config_source: ConfigSource
+        -credential_name: String
+        -config_key: Option~String~
+        +new(service, credential) Self
+        +from_config(config, credential) Self
+        +from_file(path, credential) Self
+        +from_env(var, credential) Self
+        +system() Self
+        +optional() Self
+        +as_key(key) Self
+    }
+    
+    class ConfigSource {
+        <<enum>>
+        Static(KeyringConfig)
+        File(PathBuf)
+        Env(String)
+        Default
+        +resolve() Result~KeyringConfig~
+    }
+    
+    class KeyringConfig {
+        +service: String
+        +keyrings: Vec~Keyring~
+        +optional: bool
+        +new(service) Self
+        +with_keyrings(keyrings) Self
+    }
+    
+    class Keyring {
+        <<enum>>
+        User
+        System
+        Named(String)
+    }
+    
+    Provider <|.. KeyringProvider : implements
+    KeyringProvider --> ConfigSource : has
+    ConfigSource --> KeyringConfig : resolves to
+    KeyringConfig --> "*" Keyring : contains
+```
+
+## Late Binding Flow
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant Figment
+    participant KeyringProvider
+    participant ConfigSource
+    participant KeyringConfig
+    participant OS as OS Keyring
+    
+    App->>Figment: merge(KeyringProvider::from_file(...))
+    Note over KeyringProvider: Config NOT resolved yet
+    
+    App->>Figment: extract::<Config>()
+    Figment->>KeyringProvider: data()
+    
+    KeyringProvider->>ConfigSource: resolve()
+    Note over ConfigSource: NOW reads file/env
+    ConfigSource-->>KeyringConfig: parsed config
+    
+    loop For each keyring in config.keyrings
+        KeyringProvider->>OS: get_password(service, credential)
+        alt Found
+            OS-->>KeyringProvider: secret
+            Note over KeyringProvider: Stop searching
+        else Not Found
+            Note over KeyringProvider: Try next keyring
+        end
     end
     
-    ENV --> EXTRACT[extract&lt;Config&gt;]
-    EXTRACT --> CONFIG[Final Config]
-    
-    note[Later providers override earlier]
-    style note fill:none,stroke:none
+    KeyringProvider-->>Figment: Ok({key: secret})
+    Figment-->>App: Config
 ```
-
-### Usage Patterns
-
-```rust
-// Pattern A: User keyring as secure fallback
-Figment::new()
-    .merge(File::from("config.toml"))
-    .merge(KeyringProvider::new("myapp", "api_key").optional())
-    .merge(Env::prefixed("MYAPP_"))
-    .extract()?;
-
-// Pattern B: Search user then system, env overrides all
-Figment::new()
-    .merge(File::from("config.toml"))
-    .merge(KeyringSearch::new("myapp", "api_key").user_then_system())
-    .merge(Env::prefixed("MYAPP_"))
-    .extract()?;
-
-// Pattern C: System keyring for shared server deployments
-Figment::new()
-    .merge(File::from("config.toml"))
-    .merge(KeyringProvider::new("myapp", "api_key").system())
-    .extract()?;
-```
-
----
-
-## Error Handling
-
-| Error Type | Behavior | Notes |
-|------------|----------|-------|
-| Entry not found | Recoverable if `.optional()` | For KeyringSearch, tries next keyring first |
-| Permission denied | Fatal | Security issue, especially for system keyring |
-| Keyring unavailable | Recoverable if `.optional()` | Common in headless environments |
-| Backend error | Fatal | Platform-specific failures |
-
-For `KeyringSearch`, "not found" means not found in **any** of the searched keyrings.
-
----
-
-## Profile Support
-
-```rust
-// Same secret, different profiles
-Figment::new()
-    .merge(KeyringProvider::new("myapp", "dev_db_url")
-        .as_key("database_url")
-        .with_profile(Profile::Dev))
-    .merge(KeyringProvider::new("myapp", "prod_db_url")
-        .as_key("database_url")
-        .with_profile(Profile::Prod))
-```
-
----
 
 ## Platform Keyring Mapping
 
@@ -521,163 +600,101 @@ flowchart TD
     NAMED --> WIN_NAMED
 ```
 
-| `Keyring` variant | macOS | Linux | Windows |
-|-------------------|-------|-------|---------|
-| `User` | Login Keychain | User's Secret Service collection | User's Credential Manager |
-| `System` | System Keychain | System Secret Service | Local Machine credentials |
-| `Named(x)` | Keychain file at `~/Library/Keychains/x.keychain-db` | Secret Service collection `x` | Credential target `x` |
+---
 
-### Named Keyring Platform Details
+## Error Handling
 
-**macOS**: Named keyrings map to keychain files. Create with:
-```bash
-security create-keychain -p "" ~/Library/Keychains/team-secrets.keychain-db
-security add-generic-password -s myapp -a api_key -w "secret" \
-    ~/Library/Keychains/team-secrets.keychain-db
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum KeyringError {
+    #[error("secret not found in any keyring")]
+    NotFound,
+    
+    #[error("keyring service unavailable: {0}")]
+    ServiceUnavailable(String),
+    
+    #[error("permission denied accessing keyring")]
+    PermissionDenied,
+    
+    #[error("failed to read config: {0}")]
+    ConfigError(String),
+    
+    #[error("keyring backend error: {0}")]
+    BackendError(String),
+}
 ```
 
-**Linux (Secret Service)**: Named keyrings map to collections. Create with:
-```bash
-# Create collection (may require GUI or D-Bus call)
-secret-tool store --label='myapp api_key' \
-    --collection='team-secrets' \
-    service myapp username api_key
-```
-
-**Windows**: Named keyrings use credential targets:
-```powershell
-# Stored under target "team-secrets:myapp:api_key"
-cmdkey /generic:team-secrets:myapp:api_key /user:api_key /pass:secret
-```
+For optional providers, `NotFound` and `ServiceUnavailable` return empty data instead of errors.
 
 ---
 
-## Headless Environments
+## Comparison: GLM vs This Design
 
-| Environment | Recommendation |
-|-------------|----------------|
-| CI/CD | Use env vars; keyring with `.optional()` |
-| Docker | Mount secrets or use env vars |
-| Systemd services | System keyring may work; test carefully |
-| SSH without session | Use env vars or file-based secrets |
-
----
-
-## Entry Management
-
-```bash
-# macOS - User keychain
-security add-generic-password -s myapp -a api_key -w "secret"
-
-# macOS - System keychain
-sudo security add-generic-password -s myapp -a api_key -w "secret" \
-    /Library/Keychains/System.keychain
-
-# Linux - User collection
-secret-tool store --label='myapp api_key' service myapp username api_key
-
-# Linux - System (requires root or appropriate group)
-# Platform-specific; may need to configure Secret Service
-
-# Windows - User
-cmdkey /generic:myapp:api_key /user:api_key /pass:secret
-```
+| Aspect | GLM Design | This Design |
+|--------|------------|-------------|
+| Config extraction | Hidden in `from_figment()` | Explicit (`from_config`) or late (`from_file`) |
+| Late binding | No | Yes, via `ConfigSource::File/Env` |
+| When config resolved | Construction time | `.data()` time for late-bound |
+| API clarity | Confusing (Figment + service) | Clear separation |
+| Two-phase loading | Always required | Optional (only for Figment-configured) |
+| Dynamic reconfiguration | No | Yes, with File/Env sources |
+| Config struct | Internal | Public, reusable |
 
 ---
 
 ## Testing Strategy
-
-### Mock Backend
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
     
-    fn mock_keyrings() -> MockKeyringSet {
-        let mut mocks = MockKeyringSet::new();
-        mocks.user.set("myapp", "api_key", "user_secret");
-        mocks.system.set("myapp", "api_key", "system_secret");
-        mocks
+    #[test]
+    fn static_config_resolves_immediately() {
+        let config = KeyringConfig::new("myapp")
+            .with_keyrings(vec![Keyring::User]);
+        
+        let provider = KeyringProvider::from_config(config, "api_key");
+        // Config is already resolved, no file/env access needed
     }
     
     #[test]
-    fn user_keyring_is_default() {
-        let mocks = mock_keyrings();
-        let provider = KeyringProvider::new("myapp", "api_key")
-            .with_backend(mocks);
+    fn file_config_resolves_at_data_time() {
+        // Write test config
+        std::fs::write("test_keyring.toml", r#"
+            service = "testapp"
+            keyrings = ["user"]
+        "#).unwrap();
         
-        let data = provider.data().unwrap();
-        assert_eq!(data[&Profile::Default]["api_key"], "user_secret");
+        let provider = KeyringProvider::from_file("test_keyring.toml", "api_key");
+        
+        // Config not resolved yet
+        // Would be resolved when .data() is called
     }
     
     #[test]
-    fn search_respects_order() {
-        let mocks = mock_keyrings();
-        let provider = KeyringSearch::new("myapp", "api_key")
-            .system_then_user()
-            .with_backend(mocks);
+    fn env_config_resolves_at_data_time() {
+        std::env::set_var("TEST_KEYRING", "testapp:user,system");
         
-        let data = provider.data().unwrap();
-        assert_eq!(data[&Profile::Default]["api_key"], "system_secret");
+        let provider = KeyringProvider::from_env("TEST_KEYRING", "api_key");
+        
+        // Config not resolved yet
+        // Would be resolved when .data() is called
     }
 }
-```
-
----
-
-## Future: Lazy Provider (Secondary Objective)
-
-A lazy provider defers keyring access until the value is actually used:
-
-```rust
-pub struct LazyKeyringProvider {
-    // ... same fields as KeyringProvider
-}
-
-impl Provider for LazyKeyringProvider {
-    fn data(&self) -> Result<Map<Profile, Dict>, Error> {
-        // Returns a placeholder that triggers keyring access on deserialization
-        // Requires custom Figment2 Value type or serde integration
-    }
-}
-```
-
-**Use cases**:
-- Avoid keyring prompts for unused secrets
-- Reduce startup latency
-- Support optional secrets without `.optional()` semantics
-
-**Complexity**: Requires deeper Figment2/serde integration. Defer to v2.
-
----
-
-## Dependencies
-
-```toml
-[dependencies]
-figment2 = "0.10"
-keyring = "3"
-
-[dev-dependencies]
-# Mock keyring - implementation TBD
 ```
 
 ---
 
 ## Open Questions
 
-1. **Named keyring creation**: Should the library provide helpers to create named keyrings, or leave this to platform tools?
+1. **Config caching**: Should late-bound sources cache their config, or re-read every `.data()` call?
 
-2. **Named keyring discovery**: Should we support listing available named keyrings? (Security implications)
+2. **Config validation**: Should `from_file` validate the file exists at construction, or only at `.data()`?
 
-3. **System keyring permissions**: What's the recommended way to grant app access to system keyring on each platform?
+3. **Figment ConfigSource**: Should there be a `ConfigSource::Figment(Figment)` that extracts at `.data()` time? This would enable true single-Figment usage but adds complexity.
 
-4. **Lazy provider design**: What's the best integration point with Figment2 for deferred secret loading?
-
-5. **Batch API**: Is `KeyringSearch::multi(service, &[names])` worth the complexity?
-
-6. **Named keyring path flexibility**: On macOS, should we support arbitrary paths or only `~/Library/Keychains/`?
+4. **Watch for changes**: Should file-based config support watching for changes and automatically reconfiguring?
 
 ---
 
@@ -685,130 +702,40 @@ keyring = "3"
 
 ### P0 (Required for v0.1)
 
-- [ ] `Keyring` enum (User, System, Named) with `From<&str>`
-- [ ] `KeyringProvider` with `.system()`, `.named()`, `.keyring()`
-- [ ] `KeyringProvider::from_keyring()` constructor
-- [ ] User keyring as default
-- [ ] `.as_key()`, `.optional()`, `.with_profile()`
-- [ ] Distinguishable error types
-- [ ] Mock keyring backend for testing
+- [ ] `Keyring` enum (User, System, Named) with serde support
+- [ ] `KeyringConfig` struct with serde support
+- [ ] `ConfigSource` enum with `resolve()` method
+- [ ] `KeyringProvider::new()` for simple case
+- [ ] `KeyringProvider::from_config()` for static config
+- [ ] `KeyringProvider::from_file()` for late-bound file config
+- [ ] `KeyringProvider::from_env()` for late-bound env config
+- [ ] `.system()`, `.optional()`, `.as_key()` builders
+- [ ] Provider trait implementation with late-bound resolution
+- [ ] Error types with proper Figment mapping
 
 ### P1 (Should have for v0.1)
 
-- [ ] `KeyringSearch` for multi-keyring search
-- [ ] `KeyringSearch::with_keyrings()` for explicit keyring lists
-- [ ] `.also()`, `.also_named()` for building search paths
-- [ ] `.user_then_system()` and `.system_then_user()` conveniences
-- [ ] Named keyring platform documentation (macOS/Linux/Windows)
+- [ ] `.also_named()` for adding named keyrings
+- [ ] Environment variable parsing (simple and JSON formats)
+- [ ] Platform keyring mapping documentation
 - [ ] Headless environment documentation
 
 ### P2 (Nice to have)
 
-- [ ] Figment-configured keyring selection example
-- [ ] `KeyringSearch::multi()` batch API
+- [ ] Config file watching for dynamic updates
+- [ ] `ConfigSource::Figment` for single-Figment late binding
 - [ ] Performance benchmarks
-
-### Future (v2)
-
-- [ ] `LazyKeyringProvider` for deferred access
-- [ ] Named keyring creation helpers
 
 ---
 
-## Complete System Diagram
+## Conclusion
 
-```mermaid
-flowchart TB
-    subgraph "Application"
-        APP[main.rs]
-        CONFIG_STRUCT[Config struct]
-    end
-    
-    subgraph "Figment Configuration"
-        FIGMENT[Figment::new]
-        FILE_PROV[File Provider<br/>config.toml]
-        KEYRING_PROV[KeyringProvider]
-        SEARCH_PROV[KeyringSearch]
-        ENV_PROV[Env Provider]
-        
-        FIGMENT --> FILE_PROV
-        FIGMENT --> KEYRING_PROV
-        FIGMENT --> SEARCH_PROV
-        FIGMENT --> ENV_PROV
-    end
-    
-    subgraph "Keyring Layer"
-        KEYRING_ENUM[Keyring Enum]
-        
-        subgraph "Available Keyrings"
-            USER_KR[(User Keyring)]
-            SYS_KR[(System Keyring)]
-            TEAM_KR[(team-secrets)]
-            PROJ_KR[(project-alpha)]
-        end
-        
-        KEYRING_PROV --> KEYRING_ENUM
-        SEARCH_PROV --> KEYRING_ENUM
-        KEYRING_ENUM --> USER_KR
-        KEYRING_ENUM --> SYS_KR
-        KEYRING_ENUM --> TEAM_KR
-        KEYRING_ENUM --> PROJ_KR
-    end
-    
-    subgraph "Platform Backends"
-        MAC[macOS Keychain]
-        LINUX[Linux Secret Service]
-        WIN[Windows Credential Manager]
-        
-        USER_KR -.-> MAC
-        USER_KR -.-> LINUX
-        USER_KR -.-> WIN
-        SYS_KR -.-> MAC
-        SYS_KR -.-> LINUX
-        SYS_KR -.-> WIN
-        TEAM_KR -.-> MAC
-        TEAM_KR -.-> LINUX
-        TEAM_KR -.-> WIN
-    end
-    
-    APP --> FIGMENT
-    FIGMENT -->|extract| CONFIG_STRUCT
-    
-    style USER_KR fill:#228b22,color:#fff
-    style KEYRING_PROV fill:#1e90ff,color:#fff
-    style SEARCH_PROV fill:#1e90ff,color:#fff
-```
+This design achieves the author's requirements:
 
-### Data Flow Summary
+1. ✅ **Multiple keyring support**: User, System, Named via `Keyring` enum
+2. ✅ **Figment-configured**: `KeyringConfig` is deserializable, works with any Figment source
+3. ✅ **Easy user/system selection**: `.system()` builder, defaults to user
+4. ✅ **Late binding**: `ConfigSource::File/Env` resolve at `.data()` time
+5. ✅ **Dynamic behavior**: File-based config can change between calls
 
-```mermaid
-sequenceDiagram
-    participant App
-    participant Figment
-    participant KeyringProvider
-    participant Keyring as Keyring Backend
-    participant OS as OS Keyring Service
-    
-    App->>Figment: Figment::new().merge(providers)
-    App->>Figment: extract::<Config>()
-    
-    Figment->>KeyringProvider: data()
-    KeyringProvider->>Keyring: select keyring (User/System/Named)
-    Keyring->>OS: get_password(service, credential_name)
-    
-    alt Entry Found
-        OS-->>Keyring: secret_value
-        Keyring-->>KeyringProvider: Ok(secret_value)
-        KeyringProvider-->>Figment: Ok({key: value})
-    else Entry Not Found
-        OS-->>Keyring: NotFound
-        alt .optional() set
-            KeyringProvider-->>Figment: Ok({})
-        else required
-            KeyringProvider-->>Figment: Err(Missing)
-        end
-    end
-    
-    Figment->>Figment: merge all provider data
-    Figment-->>App: Ok(Config)
-```
+The key insight is separating **what** (credential), **where** (config source), and **when** (resolution time). This enables both simple static usage and advanced late-bound dynamic configuration.
