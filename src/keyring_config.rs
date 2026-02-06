@@ -3,22 +3,17 @@
 use serde::{Deserialize, Serialize};
 
 /// Identifies which keyring to use.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Keyring {
     /// Current user's keyring (default)
+    #[default]
     User,
     /// System-wide keyring
     System,
     /// Custom named keyring
     #[serde(untagged)]
     Named(String),
-}
-
-impl Default for Keyring {
-    fn default() -> Self {
-        Keyring::User
-    }
 }
 
 impl From<&str> for Keyring {

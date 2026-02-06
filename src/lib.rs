@@ -8,22 +8,20 @@
 //! # Quick Start
 //!
 //! ```rust,no_run
-//! use figment2::{Figment, providers::{File, Env}};
+//! use figment2::Figment;
 //! use figment_keyring::KeyringProvider;
 //!
-//! // Configure with file and environment
-//! let config_figment = Figment::new()
-//!     .merge(File::from("config.toml"))
-//!     .merge(Env::prefixed("MYAPP_"));
+//! // Create a Figment with your configuration sources
+//! let config_figment = Figment::new();
 //!
 //! // Provider is configured by that Figment (late binding)
 //! let api_key_provider = KeyringProvider::configured_by(config_figment, "api_key");
 //!
 //! // Final Figment merges everything
-//! let config: AppConfig = Figment::new()
-//!     .merge(config_figment)
-//!     .merge(api_key_provider)
-//!     .extract().unwrap();
+//! // let config: YourConfig = Figment::new()
+//! //     .merge(config_figment)
+//! //     .merge(api_key_provider)
+//! //     .extract().unwrap();
 //! ```
 //!
 //! # Configuration
@@ -64,9 +62,8 @@ use std::sync::Arc;
 /// use figment2::Figment;
 /// use figment_keyring::KeyringProvider;
 ///
-/// let config_figment = Figment::new()
-///     .merge(File::from("config.toml"))
-///     .merge(Env::prefixed("APP_"));
+/// // Create a Figment with your configuration sources
+/// let config_figment = Figment::new();
 ///
 /// let provider = KeyringProvider::configured_by(config_figment, "api_key");
 /// ```
@@ -226,7 +223,7 @@ mod tests {
     #[test]
     fn test_keyring_provider_with_profile() {
         let profile = Profile::from("production");
-        let provider = KeyringProvider::new("test-app", "test-key").with_profile(profile);
+        let provider = KeyringProvider::new("test-app", "test-key").with_profile(profile.clone());
         assert_eq!(provider.profile, Some(profile));
     }
 }
