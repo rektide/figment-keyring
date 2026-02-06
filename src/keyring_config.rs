@@ -52,7 +52,9 @@ pub mod backend {
     use crate::keyring_config::Keyring;
     use keyring_core::Entry;
 
+    use std::collections::HashMap;
     use std::sync::Once;
+
     static INIT: Once = Once::new();
 
     /// Get a secret from specified keyring.
@@ -77,23 +79,21 @@ pub mod backend {
         service: &str,
         username: &str,
     ) -> std::result::Result<Entry, KeyringError> {
-        use std::collections::HashMap;
-
-        let entry: Entry = match keyring {
+        let entry = match keyring {
             Keyring::User => Entry::new(service, username)
-                .map_err(|e: keyring_core::Error| KeyringError::BackendError(e.to_string()))?,
+                .map_err(|e| KeyringError::BackendError(e.to_string()))?,
             Keyring::System => {
                 let target = default_target();
                 let mut modifiers = HashMap::new();
                 modifiers.insert("target", target.as_str());
                 Entry::new_with_modifiers(service, username, &modifiers)
-                    .map_err(|e: keyring_core::Error| KeyringError::BackendError(e.to_string()))?
+                    .map_err(|e| KeyringError::BackendError(e.to_string()))?
             }
             Keyring::Named(name) => {
                 let mut modifiers = HashMap::new();
                 modifiers.insert("target", name.as_str());
                 Entry::new_with_modifiers(service, username, &modifiers)
-                    .map_err(|e: keyring_core::Error| KeyringError::BackendError(e.to_string()))?
+                    .map_err(|e| KeyringError::BackendError(e.to_string()))?
             }
         };
         Ok(entry)
