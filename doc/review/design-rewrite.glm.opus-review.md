@@ -7,250 +7,247 @@
 
 ## Summary
 
-The GLM design correctly identifies the goal (Figment-configured keyring selection) and proposes a two-phase loading pattern. However, **the design conflates two different problems** and the `from_figment()` API is awkward. The fundamental architecture is sound, but the API needs rethinking.
+GLM correctly identifies that Figment should configure the keyring provider. However, **the design extracts configuration at construction time, not at `.data()` time**. This means configuration is frozen when the provider is created, not when secrets are actually fetched.
 
-**Verdict**: Partially approve. Core insight is correct; execution needs revision.
+**Verdict**: Core insight correct; needs late binding.
+
+---
+
+## The Core Requirement
+
+The user wants:
+
+> App builders use whatever layered Figment config they want to drive our keyring provider.
+
+This means:
+1. User builds a Figment with File, Env, Serialized, whatever layers they choose
+2. That Figment configures our keyring provider
+3. **We don't dictate the source** - no hardcoded "from_file" or "from_env"
 
 ---
 
 ## What GLM Gets Right
 
-### 1. Two-Phase Loading is Correct
+### Figment-Driven Configuration
 
-The insight that configuration loading requires two phases is correct:
-
-```
-Phase 1: Extract keyring configuration (which keyrings to search)
-Phase 2: Use that configuration to fetch secrets
-```
-
-This is the only way to achieve "Figment configures keyrings" within Figment's provider model.
-
-### 2. KeyringConfig Struct is the Right Abstraction
+The insight that Figment should drive keyring configuration is correct:
 
 ```rust
-#[derive(Deserialize)]
-pub struct KeyringConfig {
-    app_name: String,
-    keyrings: Vec<KeyringSource>,
-    // ...
-}
+// User's Figment provides keyring config
+let config_figment = Figment::new()
+    .merge(File::from("config.toml"))
+    .merge(Env::prefixed("MYAPP_"));
+
+// Keyring provider uses that config
+let provider = KeyringProvider::from_figment(config_figment, ...);
 ```
 
-Making the keyring configuration a deserializable struct is exactly right. This allows it to come from any Figment source (file, env, serialized).
+### KeyringConfig as Deserializable Struct
 
-### 3. Named Keyrings with Account Mapping
-
-The `named_keyrings` table in TOML is a good design for mapping named keyrings to accounts:
-
-```toml
-[named_keyrings.team-secrets]
-account = "dev-team"
-```
+Making `KeyringConfig` deserializable is right. It can come from any Figment source.
 
 ---
 
 ## What GLM Gets Wrong
 
-### 1. `from_figment()` is Confusing
+### 1. Early Binding, Not Late Binding
+
+GLM's `from_figment()` extracts configuration immediately at construction:
 
 ```rust
-let provider = KeyringProvider::from_figment(
-    figment,
-    "myapp",
-    "api_key",
+// GLM design (implicit)
+pub fn from_figment(figment: &Figment, ...) -> Self {
+    let config: KeyringConfig = figment.extract().unwrap(); // EXTRACTED NOW
+    Self { config, ... }
+}
+```
+
+This means:
+- Config is frozen when provider is created
+- Changes to underlying config sources don't affect the provider
+- Not true late binding
+
+**True late binding** extracts at `.data()` time:
+
+```rust
+impl Provider for KeyringProvider {
+    fn data(&self) -> Result<...> {
+        // Extract NOW, when secrets are actually needed
+        let config: KeyringConfig = self.config_figment.extract()?;
+        self.search_keyrings(&config)
+    }
+}
+```
+
+### 2. Confusing API Signature
+
+```rust
+KeyringProvider::from_figment(
+    figment,      // For extracting config
+    "myapp",      // app_name - but isn't this in the config?
+    "api_key"     // credential_name
 )?;
 ```
 
-This API is problematic:
+If `figment` provides `KeyringConfig`, why also pass `app_name`? Redundant.
 
-- **What does the Figment parameter do?** It extracts `KeyringConfig` internally, but the user also passes `"myapp"` separately. Redundant.
-- **Why pass Figment instead of KeyringConfig?** If the user already extracted `KeyringConfig`, why re-extract?
-- **Hidden extraction**: The provider does extraction internally, which is surprising.
+### 3. Two Figment Instances Still Required
 
-**Better API**:
-```rust
-// User extracts config explicitly
-let keyring_config: KeyringConfig = figment.extract()?;
+GLM's examples show:
 
-// Provider takes config, not Figment
-let provider = KeyringProvider::from_config(keyring_config, "api_key");
-```
-
-### 2. Two Separate Figment Instances is Awkward
-
-The design requires:
 ```rust
 // Figment #1 for config
 let config_figment = Figment::new().merge(File::from("config.toml"));
-let keyring_config: KeyringConfig = config_figment.extract()?;
 
-// Figment #2 for secrets
-let secrets_figment = Figment::new()
+// Figment #2 for final extraction
+let final_figment = Figment::new()
     .merge(File::from("config.toml"))  // Same file again!
     .merge(provider);
 ```
 
-Merging the same file twice is redundant and error-prone. If the file changes between extractions, you get inconsistent state.
+This is awkward. Ideally, user builds ONE Figment and we use it for both config and as a merge source.
 
-### 3. No True Late Binding
+---
 
-The design claims to support late binding, but configuration is still resolved at provider creation time. Once you call `from_figment()`, the keyrings are fixed.
+## The Right Design
 
-**True late binding** would resolve configuration at `.data()` time, not at provider construction.
+### Provider Holds Figment, Extracts at .data() Time
 
-### 4. Testing Examples Use Wrong API
-
-The test examples show:
 ```rust
-let provider = KeyringProvider::from_figment(
-    &Figment::new(),  // Empty Figment!
-    &config,          // But also passing config directly?
-    "myapp",
-    "api_key",
+pub struct KeyringProvider {
+    /// Figment that provides our configuration
+    /// Extracted at .data() time for late binding
+    config_figment: Figment,
+    
+    /// Which credential to fetch
+    credential_name: String,
+    
+    /// Optional: override config key name
+    config_key: Option<String>,
+}
+
+impl KeyringProvider {
+    /// Configure this provider using any Figment the app builder provides.
+    /// Config is extracted at .data() time, not now.
+    pub fn configured_by(figment: Figment, credential_name: &str) -> Self {
+        Self {
+            config_figment: figment,
+            credential_name: credential_name.into(),
+            config_key: None,
+        }
+    }
+}
+
+impl Provider for KeyringProvider {
+    fn data(&self) -> Result<Map<Profile, Dict>, Error> {
+        // LATE BINDING: extract config NOW
+        let config: KeyringConfig = self.config_figment.extract()?;
+        
+        // Search keyrings using extracted config
+        let secret = self.search_keyrings(&config)?;
+        
+        // Return as Figment data
+        Ok(make_map(self.config_key_or_credential(), secret))
+    }
+}
+```
+
+### Usage Pattern
+
+```rust
+// App builder uses WHATEVER Figment layers they want
+let config_figment = Figment::new()
+    .merge(File::from("base.toml"))
+    .merge(File::from("local.toml"))
+    .merge(Env::prefixed("MYAPP_"))
+    .merge(Serialized::defaults(SomeDefaults::new()));
+
+// Our provider is configured by that Figment
+// Config is NOT extracted yet
+let keyring_provider = KeyringProvider::configured_by(
+    config_figment.clone(),
+    "api_key"
 );
+
+// Final Figment merges everything
+let app_config: AppConfig = Figment::new()
+    .merge(config_figment)      // All non-secret config
+    .merge(keyring_provider)    // Secrets from keyring (extracts config HERE)
+    .extract()?;
 ```
 
-This is inconsistent with the design's stated API. If passing config directly, why also pass Figment?
+### Why This Works
+
+1. **No hardcoded sources**: User provides any Figment they want
+2. **Late binding**: Config extracted at `.data()` time, not construction
+3. **Single source of truth**: Same Figment provides both keyring config and app config
+4. **Dynamic**: If underlying sources change, next `.data()` call sees new config
 
 ---
 
-## The Core Problem
+## Comparison
 
-GLM's design tries to solve two problems with one API:
-
-1. **Configuration source**: Where does keyring config come from? (Figment, file, env)
-2. **Late binding**: When is keyring config resolved? (construction time vs `.data()` time)
-
-These are orthogonal concerns. The design conflates them by making `from_figment()` both extract config AND construct the provider.
-
----
-
-## Missing: True Late Binding
-
-The user's critique mentions wanting **late binding** and **dynamic behavior**. GLM's design doesn't achieve this.
-
-**What late binding means**:
-- Provider is constructed without knowing which keyrings to search
-- At `.data()` time, provider reads current configuration
-- Configuration can change between calls to `.data()`
-
-**How to achieve it**:
-```rust
-// Provider holds a config source, not resolved config
-let provider = KeyringProvider::new("myapp", "api_key")
-    .config_from_file("config.toml");
-
-// At .data() time, provider:
-// 1. Reads config.toml
-// 2. Extracts KeyringConfig
-// 3. Searches configured keyrings
-// 4. Returns secret
-```
-
-This is more complex but achieves true late binding.
+| Aspect | GLM Design | Correct Design |
+|--------|------------|----------------|
+| Config source | User's Figment | User's Figment |
+| When extracted | Construction time | `.data()` time |
+| Late binding | ❌ No | ✅ Yes |
+| Dynamic reconfig | ❌ No | ✅ Yes |
+| API | `from_figment(figment, app_name, ...)` | `configured_by(figment, credential)` |
+| Redundancy | Passes app_name separately | Config has everything |
 
 ---
 
-## Alternative Architecture
+## Key Insight
 
-Instead of `from_figment()`, I propose separating concerns:
+The fundamental difference is **when** configuration is resolved:
 
-### 1. KeyringConfig is Just Data
-
-```rust
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct KeyringConfig {
-    pub service: String,
-    pub keyrings: Vec<Keyring>,
-    #[serde(default)]
-    pub optional: bool,
-}
-```
-
-### 2. Provider Takes Config
-
-```rust
-// Static config (resolved at construction)
-let provider = KeyringProvider::from_config(config, "api_key");
-
-// Or: late-bound config (resolved at .data() time)
-let provider = KeyringProvider::new("api_key")
-    .config_source(ConfigSource::File("config.toml"));
-```
-
-### 3. ConfigSource Enum for Late Binding
-
-```rust
-pub enum ConfigSource {
-    /// Config is resolved now
-    Static(KeyringConfig),
+```mermaid
+flowchart TB
+    subgraph "GLM Design (Early Binding)"
+        GLM_NEW["from_figment(figment, ...)"]
+        GLM_EXTRACT["figment.extract()"]
+        GLM_FROZEN[Config FROZEN]
+        GLM_DATA["provider.data()"]
+        GLM_USE[Uses frozen config]
+        
+        GLM_NEW --> GLM_EXTRACT --> GLM_FROZEN
+        GLM_FROZEN -.->|later| GLM_DATA --> GLM_USE
+    end
     
-    /// Read config from file at .data() time
-    File(PathBuf),
+    subgraph "Correct Design (Late Binding)"
+        CORRECT_NEW["configured_by(figment, ...)"]
+        CORRECT_STORE[Store Figment reference]
+        CORRECT_DATA["provider.data()"]
+        CORRECT_EXTRACT["figment.extract()"]
+        CORRECT_FRESH[Config FRESH]
+        
+        CORRECT_NEW --> CORRECT_STORE
+        CORRECT_STORE -.->|later| CORRECT_DATA --> CORRECT_EXTRACT --> CORRECT_FRESH
+    end
     
-    /// Read config from env var at .data() time
-    Env(String),
-    
-    /// Read config from multiple sources at .data() time
-    Layered(Vec<ConfigSource>),
-}
+    style GLM_FROZEN fill:#8b0000,color:#fff
+    style CORRECT_FRESH fill:#228b22,color:#fff
 ```
 
-This cleanly separates:
-- **What** to fetch (credential_name)
-- **Where** to get config (ConfigSource)
-- **When** to resolve config (construction vs .data())
+This enables:
+- Config files can be edited between provider creation and `.data()` call
+- Environment variables can change
+- Same provider works across different environments
+- True late binding
 
 ---
 
-## Comparison Table
+## Recommendations for GLM Design
 
-| Aspect | GLM Design | My Proposal |
-|--------|------------|-------------|
-| Config extraction | Hidden in `from_figment()` | Explicit by user |
-| Late binding | No | Yes, via ConfigSource |
-| API clarity | Confusing (Figment + app_name) | Clear (config OR config source) |
-| Two-phase loading | Required | Optional (only if using Static) |
-| Dynamic reconfiguration | No | Yes, with File/Env sources |
+1. **Store Figment, don't extract from it**
+   - `from_figment()` should store the Figment, not extract immediately
 
----
+2. **Remove redundant parameters**
+   - Don't pass `app_name` if it's in the config
 
-## Recommendations
+3. **Extract at `.data()` time**
+   - This achieves true late binding
 
-### For GLM Design to Work
-
-1. **Replace `from_figment()` with `from_config()`**
-   - User extracts config explicitly
-   - Provider just uses it
-
-2. **Add `ConfigSource` for late binding**
-   - Allow provider to read config at `.data()` time
-   - Enables dynamic reconfiguration
-
-3. **Don't require two Figment instances**
-   - If using explicit extraction, user handles it
-   - If using ConfigSource, provider handles it internally
-
-4. **Fix test examples**
-   - Consistent API throughout
-
-### My Revised Design Will
-
-1. Keep `KeyringConfig` as a plain deserializable struct
-2. Offer both static (`from_config`) and late-bound (`config_source`) construction
-3. Support ConfigSource::Figment for true Figment integration
-4. Avoid requiring users to create two Figment instances
-
----
-
-## Conclusion
-
-GLM's design has the right goal but awkward execution. The `from_figment()` API conflates extraction with construction and doesn't achieve true late binding. The two-Figment pattern is redundant.
-
-My revised design will separate:
-1. **Config definition** (KeyringConfig struct)
-2. **Config sourcing** (static vs late-bound)
-3. **Secret fetching** (the actual keyring access)
-
-This enables both simple static usage and advanced late-bound dynamic configuration.
+4. **Consider single-Figment pattern**
+   - User's Figment can be both config source AND merged into final result
