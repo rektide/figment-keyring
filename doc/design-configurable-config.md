@@ -1,285 +1,354 @@
-# Configurable Keyring Provider Design
+# Configurable Config Schema Design
 
 ## Problem Statement
 
-The current `KeyringProvider` implementation supports flexible configuration through Figment2's late-binding pattern. However, there are **hardcoded aspects** that cannot be customized:
+**Core Issue**: Applications using figment-keyring are forced to use our hardcoded field names (`service`, `keyrings`, `optional`) in their configuration files. They cannot use their own naming conventions.
 
-1. **Fixed credential identifier mapping** - The provider uses `credential_name` as both:
-   - The username/key in keyring lookup
-   - The default config key in Figment output
+---
 
-   Example:
-   ```toml
-   # config.toml
-   service = "myapp"
-   keyrings = ["user", "system"]
-   ```
-
-   This results in:
-   - Keyring lookup: `Entry::new("myapp", "api_key")`
-   - Config output: `{ "api_key": "secret" }`
-
-   **Limitation**: Only `credential_name` can be customized. If you need different keys for different profiles or environments, you're out of luck.
-
-## Current Hardcoded Behaviors
-
-### 1. Username/Key Identifier
-
-The `KeyringConfig` defines:
-- `service` - The service name (first part of keyring entry)
-- `keyrings` - Which keyrings to search (user, system, named)
-- `optional` - Whether to fail on missing secrets
-
-**What's NOT configurable:**
-- **Username** - Always uses `self.credential_name` for lookup
-- **Target** - System keyring uses hardcoded target string; Named keyrings use their name as target
-
-### 2. Config Key Mapping
-
-The provider always returns:
-```rust
-dict.insert(key, value);
-```
-
-Where `key = self.config_key.unwrap_or(&self.credential_name)`
-
-**Limitation**: Cannot map keyring credentials to multiple config keys without creating multiple providers.
-
-## Use Cases Needing Flexibility
-
-### Use Case 1: Per-Keyring Credentials
-
-**Scenario**: You need to fetch multiple credentials from the same keyring with different usernames:
-
-```rust
-// What you want to do:
-let providers = vec![
-    KeyringProvider::configured_by(figment, "api_key"),
-    KeyringProvider::configured_by(figment, "db_password"),
-];
-
-// Current limitation: Both use same credential_name
-// They would BOTH return { "api_key": "..." }
-// Figment would merge and you'd get only one value
-```
-
-**Problem**: Provider `metadata()` doesn't distinguish between providers. All use same `keyring` metadata name.
-
-### Use Case 2: Environment-Specific Keys
-
-**Scenario**: Different environments need different config keys:
-
-```rust
-// Development
-let dev_config = KeyringConfig {
-    service: "myapp-dev".to_string(),
-    keyrings: vec![Keyring::User],
-    optional: true,
-};
-
-// Production
-let prod_config = KeyringConfig {
-    service: "myapp-prod".to_string(),
-    keyrings: vec![Keyring::System],
-    optional: false,
-};
-```
-
-**Problem**: Can't switch between these without creating different providers for each environment.
-
-### Use Case 3: Complex Lookup Rules
-
-**Scenario**: Application needs custom lookup logic based on multiple criteria:
-
-- Different username patterns for different credential types
-- Fallback chains across multiple keyrings
-- Custom entry selection logic
-
-**Current limitation**: Provider only supports:
-- Fixed list of keyrings to search in order
-- Boolean `optional` flag
-- Single `credential_name` for all lookups
-
-## Possible Solutions
-
-### Solution A: Per-Keyring Configuration Map
-
-Allow each keyring to specify its own username and config key:
+## Current State (Fixed Schema)
 
 ```toml
-# config.toml
-[keyrings.user]
-username = "db_user"
-config_key = "db.api_key"
-
-[keyrings.system]
-username = "db_admin"
-config_key = "db.admin_password"
+# config.toml - CONSUMER MUST USE THESE EXACT FIELD NAMES
+[keyring]
+service = "myapp"
+keyrings = ["user", "system"]
+optional = false
 ```
 
-**Pros:**
-- Clear, declarative configuration
-- No code changes needed
-- Supports many-to-many mapping
-
-**Cons:**
-- Significant config file schema change
-- More complex deserialization
-- Requires changes to `KeyringConfig` structure
-
-### Solution B: Nested Config Structure
-
-Allow nested configuration to specify per-keyring settings:
-
+**Problem**: If the consumer prefers:
 ```toml
-# config.toml
-[keyrings]
-[[keyrings.user]]
-name = "db"
-username = "db_user"
-config_key = "api_key"
-
-[[keyrings.user]]
-name = "secrets"
-username = "secrets_user"
-config_key = "secrets_api_key"
+# What consumer wants to use
+[secrets]
+app_name = "myapp"           # instead of service
+stores = ["user"]           # instead of keyrings
+allow_missing = false       # instead of optional
 ```
 
-**Pros:**
-- Supports many-to-many per-keyring configuration
-- Flexible and extensible
-- Declarative
+They **cannot** do this with the current API.
 
-**Cons:**
-- Config file becomes complex
-- Requires major refactoring
-- More complex error messages
+---
 
-### Solution C: Provider Factory Pattern
+## Root Cause Analysis
 
-Allow users to build custom providers:
+The `KeyringProvider::configured_by()` constructor uses Figment extraction with hardcoded field names:
 
 ```rust
-trait KeyringProviderFactory {
-    fn create_provider(
-        config: &KeyringConfig,
-        credential_name: &str,
-        username: &str,
-        config_key: Option<&str>,
-    ) -> impl Provider;
-}
-
-// User implementation
-struct MyProvider {
-    provider: impl Provider,
-}
-
-impl KeyringProviderFactory for MyProvider {
-    fn create_provider(/* ... */) -> impl Provider {
-        // Custom lookup logic
-    Box::new(MyProvider { provider })
+impl KeyringProvider {
+    pub fn configured_by(figment: Arc<Figment>, credential_name: &str) -> Self {
+        // Later, in data():
+        let config: KeyringConfig = figment.extract()?;  // ← Hardcoded field names!
     }
 }
 
-// Usage
-let factory = MyProvider;
-let provider = factory.create_provider(
-    &config,
-    "api_key",
-    "db_user",
-    Some("db.api_key")
-);
+#[derive(Deserialize)]
+pub struct KeyringConfig {
+    service: String,           // ← Hardcoded
+    keyrings: Vec<Keyring>,    // ← Hardcoded
+    optional: bool,            // ← Hardcoded
+}
+```
+
+**Problem**: `figment.extract::<KeyringConfig>()` requires exact field name match.
+
+---
+
+## Solutions
+
+### Solution A: Consumer Provides Config Directly (Recommended)
+
+Add a constructor that accepts `KeyringConfig` directly, bypassing Figment extraction.
+
+```rust
+impl KeyringProvider {
+    /// Create provider with explicit configuration.
+    /// 
+    /// For consumers who want full control over configuration schema.
+    /// This bypasses Figment extraction entirely.
+    /// 
+    /// # Example
+    /// 
+    /// ```ignore
+    /// // Consumer uses their own config schema
+    /// #[derive(Deserialize)]
+    /// struct MySecretsConfig {
+    ///     app_name: String,
+    ///     secret_stores: Vec<Keyring>,
+    ///     allow_missing: bool,
+    /// }
+    /// 
+    /// let my_cfg: MySecretsConfig = figment.focus("secrets").extract()?;
+    /// let keyring_cfg = KeyringConfig {
+    ///     service: my_cfg.app_name,
+    ///     keyrings: my_cfg.secret_stores,
+    ///     optional: my_cfg.allow_missing,
+    /// };
+    /// 
+    /// let provider = KeyringProvider::with_config(keyring_cfg, "api_key");
+    /// ```
+    pub fn with_config(config: KeyringConfig, credential_name: &str) -> Self {
+        let figment = Arc::new(Figment::from(Serialized::defaults(config)));
+        Self::configured_by(figment, credential_name)
+    }
+}
 ```
 
 **Pros:**
-- Maximum flexibility
-- Allows arbitrary custom logic
-- No breaking changes to core API
+- Zero complexity
+- Full schema flexibility
+- Type safe
+- No breaking changes
+- Composable with any config structure
 
 **Cons:**
-- Significantly more complex
-- Requires trait object and heap allocation
-- Loses simplicity of direct struct
+- Consumer must manually map their config to `KeyringConfig`
+- Requires extra code for custom schema users
 
-### Solution D: Do Nothing (Release v1.0 with Current Design)
+---
 
-**Recommendation**: Document current limitations and release as v1.0.
+### Solution B: Builder with Field Name Mapping (Alternative)
 
-**Rationale:**
-- Current implementation is correct for the documented use cases in Opus spec
-- `KeyringConfig` with `service`, `keyrings`, `optional` is sufficient
-- Users wanting advanced patterns can use the provider factory pattern (Solution C) externally
-- We provide a simple, well-documented API
+Allow runtime field name remapping via builder pattern.
 
-**What users can do today:**
 ```rust
-// Multiple credentials - use focused Figment for different paths
-let config_figment = Figment::new()
-    .merge(Toml::file("config.toml"));
+#[derive(Debug, Clone, Default)]
+pub struct FieldAliases {
+    pub service: Option<String>,
+    pub keyrings: Option<String>,
+    pub optional: Option<String>,
+}
 
-let db_api_key = KeyringProvider::focused(
-    config_figment.focused("keyrings.user.config_key"),
+impl KeyringProvider {
+    pub fn with_field_aliases(mut self, aliases: FieldAliases) -> Self {
+        self.field_aliases = Some(aliases);
+        self
+    }
+}
+```
+
+**Usage:**
+```rust
+let aliases = FieldAliases {
+    service: Some("app_name".into()),
+    keyrings: Some("secret_stores".into()),
+    optional: Some("allow_missing".into()),
+};
+
+let provider = KeyringProvider::configured_by(figment, "api_key")
+    .with_field_aliases(aliases);
+```
+
+**Pros:**
+- Declarative configuration
+- No manual mapping code
+
+**Cons:**
+- Requires manual Figment extraction logic
+- Runtime string matching
+- More complex implementation
+- Harder to maintain
+
+---
+
+### Solution C: Generic Config with Into Trait (Alternative)
+
+Allow any config type that can convert to `KeyringConfig`.
+
+```rust
+impl<C> KeyringProvider 
+where
+    C: Into<KeyringConfig> + serde::de::DeserializeOwned,
+{
+    pub fn configured_by_custom<C>(
+        figment: Arc<Figment>,
+        credential_name: &str,
+    ) -> Result<Self, Error> 
+    {
+        let custom_config: C = figment.extract()?;
+        let keyring_config = custom_config.into();
+        Ok(Self::with_config(keyring_config, credential_name))
+    }
+}
+```
+
+**Usage:**
+```rust
+#[derive(Deserialize)]
+struct MyConfig {
+    app_name: String,
+    stores: Vec<Keyring>,
+    allow_missing: bool,
+}
+
+impl From<MyConfig> for KeyringConfig {
+    fn from(cfg: MyConfig) -> Self {
+        Self {
+            service: cfg.app_name,
+            keyrings: cfg.stores,
+            optional: cfg.allow_missing,
+        }
+    }
+}
+
+let provider = KeyringProvider::configured_by_custom::<MyConfig>(
+    figment,
     "api_key"
+)?;
+```
+
+**Pros:**
+- Type safe
+- Clean consumer code
+
+**Cons:**
+- Generic complexity
+- Still requires `Into` implementation
+- Less discoverable than Solution A
+
+---
+
+## Recommendation
+
+**Solution A (Consumer Provides Config Directly)** is the best choice:
+
+1. **Simplicity** - Single new constructor, minimal implementation
+2. **Flexibility** - Complete control over config schema
+3. **Type Safety** - No runtime string matching
+4. **No Breaking Changes** - Existing API unchanged
+5. **Discoverability** - Clear use case in documentation
+
+**Tradeoff:** Consumers with custom schemas write 5-10 lines of mapping code. This is acceptable and keeps our library simple.
+
+---
+
+## Implementation Plan
+
+### Phase 1: Core API (P0)
+
+- [ ] Add `KeyringProvider::with_config(config, credential_name)` constructor
+- [ ] Add unit tests for `with_config()` constructor
+- [ ] Verify existing tests still pass
+
+### Phase 2: Documentation (P0)
+
+- [ ] Document `with_config()` with examples
+- [ ] Add "Bring Your Own Config" pattern section to README
+- [ ] Show example with consumer-defined config schema
+- [ ] Document conversion from custom config to `KeyringConfig`
+
+### Phase 3: Quality (P1)
+
+- [ ] Add integration test showing custom schema usage
+- [ ] Add doctests demonstrating the pattern
+- [ ] Run clippy and fix warnings
+
+---
+
+## Usage Examples
+
+### Example 1: Consumer Uses Their Own Schema
+
+```rust
+// Consumer's config file
+// secrets.toml
+[secrets]
+app_name = "mycompany"
+stores = ["user", "custom_vault"]
+allow_missing = true
+
+// Consumer's code
+use figment2::providers::Toml;
+use figment_keyring::{KeyringProvider, KeyringConfig, Keyring};
+
+// Consumer's config struct (their naming convention)
+#[derive(Deserialize)]
+struct SecretsConfig {
+    app_name: String,
+    stores: Vec<Keyring>,
+    allow_missing: bool,
+}
+
+// Load config
+let figment = Figment::new()
+    .merge(Toml::file("secrets.toml"));
+
+// Extract with their schema
+let secrets: SecretsConfig = figment.focus("secrets").extract()?;
+
+// Map to our config type
+let keyring_config = KeyringConfig {
+    service: secrets.app_name,
+    keyrings: secrets.stores,
+    optional: secrets.allow_missing,
+};
+
+// Create provider
+let provider = KeyringProvider::with_config(keyring_config, "api_token");
+```
+
+### Example 2: Multiple Credentials from Custom Schema
+
+```rust
+// Consumer's config
+// config.toml
+[database]
+service = "myapp-db"
+keyrings = ["user", "vault"]
+optional = false
+
+[api]
+service = "myapp-api"
+keyrings = ["system"]
+optional = true
+
+// Consumer's code
+#[derive(Deserialize)]
+struct AppConfig {
+    database: KeyringConfig,
+    api: KeyringConfig,
+}
+
+let app_config: AppConfig = figment.extract()?;
+
+let db_provider = KeyringProvider::with_config(
+    app_config.database,
+    "db_password"
 );
 
-let db_admin_password = KeyringProvider::focused(
-    config_figment.focused("keyrings.user.username"),
-    "admin_password"
-);
-
-// Environment-specific
-let staging_config = Figment::new()
-    .merge(Toml::file("config-staging.toml"))
-    .merge(Env::prefixed("APP_"));
-
-let staging_provider = KeyringProvider::configured_by(
-    staging_config,
+let api_provider = KeyringProvider::with_config(
+    app_config.api,
     "api_key"
 );
 ```
 
-## Decision Needed
+### Example 3: Existing API Still Works
 
-Before implementing any of these solutions, we need to decide:
+```rust
+// Consumers happy with our schema can still use configured_by()
+let provider = KeyringProvider::configured_by(figment, "api_key")
+    .focused("keyring");
+```
 
-1. **Scope creep** - Are we trying to be a universal configuration framework?
-2. **API stability** - Do we break the simple, documented API that matches the Opus spec?
-3. **Use cases** - What real-world problems are users encountering that require these features?
+---
 
-**Questions to answer:**
-1. Are there specific, documented user requirements for configurable usernames/keys?
-2. Is this out of scope for v1.0?
-3. Should we implement a factory trait pattern in v1.1 instead?
-4. Which solution (A-D) best balances flexibility and complexity?
+## Comparison Matrix
 
-## Implementation Complexity
+| Solution | Complexity | Breaking Changes | Flexibility | Implementation Effort |
+|----------|------------|------------------|-------------|---------------------|
+| A: Direct Config | Low | None | High | ~10 lines |
+| B: Field Mapping | Medium | None | High | ~50 lines |
+| C: Generic Into | Medium | None | High | ~30 lines |
 
-| Solution | API Changes | Breaking Changes | Complexity | Risk |
-|-----------|-------------|-----------------|------------|------|
-| A: Per-Keyring Config | Medium | No | Medium | Low |
-| B: Nested Config | High | No | High | High |
-| C: Factory Pattern | High | No | High | Low |
-| D: Do Nothing | None | None | Low | None |
+---
 
 ## Conclusion
 
-The current `KeyringProvider` with `service`, `keyrings`, and `optional` fields is **simple and sufficient** for the use cases defined in the Opus specification:
+The problem is **config schema inflexibility**, not credential mapping complexity.
 
-- Single credential lookup with configurable service name
-- Multi-keyring search in priority order
-- Optional secrets support
-- Late-binding configuration via Figment
+**Solution A** (`with_config()`) provides the right balance:
+- Simple API addition
+- Full consumer control
+- Zero breaking changes
+- Clear documentation path
 
-For advanced use cases, users should use the **provider factory pattern** (Solution C) or create custom providers that build on `KeyringProvider`.
-
-This keeps the core API:
-- Simple
-- Well-documented
-- Stable
-- Easy to understand
-
-## References
-
-- [Opus Specification](doc/review/design-rewrite.opus.md) - Original design specification
-- [Current README](README.md) - Documented API and usage
-- [Figment2 Documentation](https://docs.rs/figment2/) - For understanding Figment's capabilities
+Consumers get complete flexibility with minimal library complexity.
