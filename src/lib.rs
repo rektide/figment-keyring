@@ -35,6 +35,28 @@
 //! keyrings = ["user", "team-secrets"]
 //! optional = false
 //! ```
+//!
+//! ## Nested Configuration
+//!
+//! For nested configuration structures, use the [`focused()`](KeyringProvider::focused)
+//! method to focus on a specific path:
+//!
+//! ```toml
+//! # config.toml
+//! [keyring]
+//! service = "myapp"
+//! keyrings = ["user"]
+//! optional = false
+//! ```
+//!
+//! ```rust,no_run
+//! # use figment2::Figment;
+//! # use figment_keyring::KeyringProvider;
+//! let config_figment = Figment::new();
+//!
+//! let provider = KeyringProvider::configured_by(config_figment, "api_key")
+//!     .focused("keyring");
+//! ```
 
 pub mod error;
 pub mod keyring_config;
@@ -81,6 +103,61 @@ impl KeyringProvider {
             credential_name: credential_name.into(),
             config_key: None,
             profile: None,
+        }
+    }
+
+    /// Create a new provider with a Figment focused on a nested path.
+    ///
+    /// This is useful when your keyring configuration is nested within a larger
+    /// configuration structure. For example, if your TOML configuration has a
+    /// `[keyring]` section:
+    ///
+    /// ```toml
+    /// # config.toml
+    /// [keyring]
+    /// service = "myapp"
+    /// keyrings = ["user", "team-secrets"]
+    /// optional = false
+    ///
+    /// [database]
+    /// # ...
+    /// ```
+    ///
+    /// You can focus on the `[keyring]` section:
+    ///
+    /// ```rust,no_run
+    /// # use figment2::Figment;
+    /// # use figment_keyring::KeyringProvider;
+    /// let config_figment = Figment::new();
+    ///
+    /// // Focus on the [keyring] section
+    /// let provider = KeyringProvider::configured_by(config_figment, "api_key")
+    ///     .focused("keyring");
+    /// ```
+    ///
+    /// You can also focus on deeply nested paths:
+    ///
+    /// ```toml
+    /// # config.toml
+    /// [services.database]
+    /// service = "myapp-db"
+    /// keyrings = ["system"]
+    /// optional = false
+    /// ```
+    ///
+    /// ```rust,no_run
+    /// # use figment2::Figment;
+    /// # use figment_keyring::KeyringProvider;
+    /// # let config_figment = Figment::new();
+    /// let provider = KeyringProvider::configured_by(config_figment, "db_password")
+    ///     .focused("services.database");
+    /// ```
+    pub fn focused(&self, path: &str) -> Self {
+        Self {
+            config_figment: Arc::new(self.config_figment.focus(path)),
+            credential_name: self.credential_name.clone(),
+            config_key: self.config_key.clone(),
+            profile: self.profile.clone(),
         }
     }
 
@@ -225,5 +302,34 @@ mod tests {
         let profile = Profile::from("production");
         let provider = KeyringProvider::new("test-app", "test-key").with_profile(profile.clone());
         assert_eq!(provider.profile, Some(profile));
+    }
+
+    #[test]
+    fn test_keyring_provider_focused() {
+        let config_figment = Figment::new();
+        let provider = KeyringProvider::configured_by(config_figment, "api_key");
+        let focused_provider = provider.focused("keyring");
+        assert_eq!(focused_provider.credential_name, "api_key");
+        assert_eq!(focused_provider.config_key, None);
+        assert_eq!(focused_provider.profile, None);
+    }
+
+    #[test]
+    fn test_keyring_provider_focused_preserves_config_key() {
+        let config_figment = Figment::new();
+        let provider =
+            KeyringProvider::configured_by(config_figment, "api_key").as_key("custom_key");
+        let focused_provider = provider.focused("keyring");
+        assert_eq!(focused_provider.config_key, Some("custom_key".into()));
+    }
+
+    #[test]
+    fn test_keyring_provider_focused_preserves_profile() {
+        let config_figment = Figment::new();
+        let profile = Profile::from("production");
+        let provider =
+            KeyringProvider::configured_by(config_figment, "api_key").with_profile(profile.clone());
+        let focused_provider = provider.focused("keyring");
+        assert_eq!(focused_provider.profile, Some(profile));
     }
 }

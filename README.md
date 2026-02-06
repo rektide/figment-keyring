@@ -32,14 +32,14 @@ figment2 = { version = "0.11", features = ["env"] }
 
 The provider uses the `keyring` crate which supports multiple platforms:
 
-| Platform      | Backend (keyring crate)                    | Status       |
-|---------------|--------------------------------------------|--------------|
-| macOS         | Keychain Services                          | Supported    |
-| Windows       | Credential Manager                        | Supported    |
-| Linux         | Secret Service / Keyutils                 | Supported    |
-| iOS           | Keychain Services                          | Supported    |
-| FreeBSD        | Secret Service                             | Supported    |
-| OpenBSD        | Secret Service                             | Supported    |
+| Platform | Backend (keyring crate)   | Status    |
+| -------- | ------------------------- | --------- |
+| macOS    | Keychain Services         | Supported |
+| Windows  | Credential Manager        | Supported |
+| Linux    | Secret Service / Keyutils | Supported |
+| iOS      | Keychain Services         | Supported |
+| FreeBSD  | Secret Service            | Supported |
+| OpenBSD  | Secret Service            | Supported |
 
 ## Usage
 
@@ -96,6 +96,35 @@ let config = Figment::new()
     .unwrap();
 ```
 
+### Nested Configuration
+
+For more flexible configuration, the provider can work with a focused Figment that contains keyring configuration in a nested path:
+
+```rust
+use figment2::Figment;
+use figment_keyring::KeyringProvider;
+
+let config_figment = Figment::new()
+    .merge(Toml::file("config.toml"));
+
+let provider = KeyringProvider::configured_by(
+    config_figment.focused("keyring"), // Only extracts [keyring] section
+    "api_key"
+);
+```
+
+Example TOML configuration:
+
+```toml
+[keyring]
+service = "myapp"
+keyrings = ["user", "system"]
+optional = false
+
+[database]
+host = "localhost"
+```
+
 ### Optional Secrets
 
 ```rust
@@ -112,6 +141,18 @@ let provider = KeyringProvider::configured_by(
     Figment::from(Serialized::defaults(config)),
     "api_key"
 );
+```
+
+### Key Mapping
+
+Map keyring entries to different config keys:
+
+```rust
+use figment2::Figment;
+use figment_keyring::KeyringProvider;
+
+let provider = KeyringProvider::configured_by(figment, "api_key")
+    .as_key("credentials.password"); // Maps to "credentials.password" in config
 ```
 
 ### Key Mapping
@@ -176,11 +217,11 @@ pub enum Keyring {
 
 ## Platform Support
 
-| Keyring      | macOS                         | Linux                          | Windows                   |
-|--------------|--------------------------------|---------------------------------|----------------------------|
-| User         | Login Keychain                | User Secret Service             | User Credential Manager     |
-| System       | System Keychain                | System Secret Service            | Local Machine credentials     |
-| Named(x)     | Keychain `x.keychain-db`    | Collection `x`                  | Target `x`                  |
+| Keyring  | macOS                    | Linux                 | Windows                   |
+| -------- | ------------------------ | --------------------- | ------------------------- |
+| User     | Login Keychain           | User Secret Service   | User Credential Manager   |
+| System   | System Keychain          | System Secret Service | Local Machine credentials |
+| Named(x) | Keychain `x.keychain-db` | Collection `x`        | Target `x`                |
 
 ## API
 
@@ -219,7 +260,7 @@ impl Provider for KeyringProvider {
 
 Licensed under either of
 
-* MIT License ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>
-* Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>
+- MIT License ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>
 
 at your option.
