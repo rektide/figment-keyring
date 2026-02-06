@@ -50,11 +50,14 @@ fn default_keyrings() -> Vec<Keyring> {
 pub mod backend {
     use crate::error::{KeyringError, Result};
     use crate::keyring_config::Keyring;
+    use keyring_core::Entry;
 
-    extern crate keyring as keyring_crate;
+    use std::sync::Once;
+    static INIT: Once = Once::new();
 
-    /// Get a secret from the specified keyring.
+    /// Get a secret from specified keyring.
     pub fn get_secret(keyring: &Keyring, service: &str, username: &str) -> Result<String> {
+        ensure_native_store_initialized();
         let entry = create_entry(keyring, service, username)?;
         let password = entry
             .get_password()
@@ -62,21 +65,36 @@ pub mod backend {
         Ok(password)
     }
 
-    /// Create a keyring entry for the specified keyring type.
+    fn ensure_native_store_initialized() {
+        INIT.call_once(|| {
+            keyring::use_native_store(false).expect("Failed to initialize native keyring store");
+        });
+    }
+
+    /// Create a keyring entry for specified keyring type.
     fn create_entry(
         keyring: &Keyring,
         service: &str,
         username: &str,
-    ) -> std::result::Result<keyring_crate::Entry, KeyringError> {
-        let entry = match keyring {
-            Keyring::User => keyring_crate::Entry::new(service, username)
-                .map_err(|e| KeyringError::BackendError(e.to_string()))?,
+    ) -> std::result::Result<Entry, KeyringError> {
+        use std::collections::HashMap;
+
+        let entry: Entry = match keyring {
+            Keyring::User => Entry::new(service, username)
+                .map_err(|e: keyring_core::Error| KeyringError::BackendError(e.to_string()))?,
             Keyring::System => {
-                keyring_crate::Entry::new_with_target(&default_target(), service, username)
-                    .map_err(|e| KeyringError::BackendError(e.to_string()))?
+                let target = default_target();
+                let mut modifiers = HashMap::new();
+                modifiers.insert("target", target.as_str());
+                Entry::new_with_modifiers(service, username, &modifiers)
+                    .map_err(|e: keyring_core::Error| KeyringError::BackendError(e.to_string()))?
             }
-            Keyring::Named(name) => keyring_crate::Entry::new_with_target(name, service, username)
-                .map_err(|e| KeyringError::BackendError(e.to_string()))?,
+            Keyring::Named(name) => {
+                let mut modifiers = HashMap::new();
+                modifiers.insert("target", name.as_str());
+                Entry::new_with_modifiers(service, username, &modifiers)
+                    .map_err(|e: keyring_core::Error| KeyringError::BackendError(e.to_string()))?
+            }
         };
         Ok(entry)
     }

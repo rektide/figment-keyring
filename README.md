@@ -28,19 +28,18 @@ figment-keyring = "0.1"
 figment2 = { version = "0.11", features = ["env"] }
 ```
 
-Enable platform-specific keyring support:
+## Platform Support
 
-```toml
-[dependencies]
-figment-keyring = { version = "0.1", features = ["platform-native"] }
-```
+The provider uses the `keyring` crate which supports multiple platforms:
 
-Platform-specific features:
-- `apple-native` - macOS Keychain support
-- `windows-native` - Windows Credential Manager support
-- `linux-native` - Linux keyutils support
-- `sync-secret-service` - Linux Secret Service (synchronous)
-- `async-secret-service` - Linux Secret Service (asynchronous)
+| Platform      | Backend (keyring crate)                    | Status       |
+|---------------|--------------------------------------------|--------------|
+| macOS         | Keychain Services                          | Supported    |
+| Windows       | Credential Manager                        | Supported    |
+| Linux         | Secret Service / Keyutils                 | Supported    |
+| iOS           | Keychain Services                          | Supported    |
+| FreeBSD        | Secret Service                             | Supported    |
+| OpenBSD        | Secret Service                             | Supported    |
 
 ## Usage
 
