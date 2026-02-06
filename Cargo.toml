@@ -1,0 +1,10 @@
+[package]
+name = "figment-keyring"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+figment2 = { version = "0.11", features = ["env"] }
+serde = { version = "1", features = ["derive"] }
+keyring = "3"
+thiserror = "1"
